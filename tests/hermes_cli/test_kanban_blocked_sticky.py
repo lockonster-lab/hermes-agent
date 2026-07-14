@@ -49,8 +49,34 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Worker-initiated kanban_block must be sticky
+# Explicitly blocked tasks must be sticky
 # ---------------------------------------------------------------------------
+
+
+def test_initially_blocked_task_is_not_auto_promoted_by_recompute_ready(
+    kanban_home: Path,
+) -> None:
+    """A task created for a separate human approval must not be dispatched.
+
+    ``initial_status='blocked'`` is used by external intake integrations to
+    create a task before any dispatch approval exists. It must carry the
+    same sticky-block invariant as an explicit operator block; otherwise the
+    next dispatcher tick turns it into ``ready`` and can start a worker.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="awaiting explicit dispatch approval",
+            initial_status="blocked",
+        )
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()[-1]["kind"] == "blocked"
 
 
 def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:

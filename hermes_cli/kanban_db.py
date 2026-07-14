@@ -2681,6 +2681,21 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if initial_status == "blocked":
+                    # ``recompute_ready`` deliberately auto-recovers
+                    # non-sticky blocked tasks. A task created explicitly
+                    # blocked, however, is awaiting human approval and must
+                    # not be dispatched before an explicit unblock.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status_blocked",
+                            "kind": "needs_input",
+                            "recurrences": 1,
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
