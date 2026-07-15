@@ -3610,6 +3610,14 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    candidates = [
+        get_task(conn, row["id"])
+        for row in conn.execute("SELECT id FROM tasks WHERE status IN ('todo', 'blocked')").fetchall()
+    ]
+    preflight_ok = {
+        task.id for task in candidates
+        if task is not None and _declared_worktree_preflight_error(task) is None
+    }
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -3618,6 +3626,8 @@ def recompute_ready(
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
+            if task_id not in preflight_ok:
+                continue
             cur_status = row["status"]
             if row["requires_manual_promotion"]:
                 # ``promote_task`` is the only exit from an explicit approval
@@ -5504,6 +5514,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    candidate = get_task(conn, task_id)
+    if candidate is not None and _declared_worktree_preflight_error(candidate):
+        return False
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
