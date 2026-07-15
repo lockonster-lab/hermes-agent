@@ -326,6 +326,30 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_quarantines_manual_gate_before_auxiliary_call(kanban_home):
+    """A bad triage transition cannot turn an approval gate into model work."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="approval-gated",
+            initial_status="blocked",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+
+    with patch("agent.auxiliary_client.get_text_auxiliary_client") as get_client:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+
+    get_client.assert_not_called()
+    assert outcome.ok is False
+    assert "explicit coordinator" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+    assert task.status == "blocked"
+    assert any(event.kind == "auto_decomposition_withheld" for event in events)
+
+
 def test_decompose_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", triage=True)

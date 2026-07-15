@@ -17,11 +17,14 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban import _task_to_dict
 
 
 @pytest.fixture
@@ -128,6 +131,114 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         payload = events[-1].payload or {}
         assert payload.get("recurrences") == 2
         assert payload.get("kind") == "capability"
+
+
+def test_initially_blocked_task_stays_quarantined_on_same_capability_loop(
+    kanban_home: Path,
+) -> None:
+    """An approval-gated task must not enter triage and trigger auto-decompose."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="approval-gated",
+            assignee="worker",
+            initial_status="blocked",
+        )
+        # Generic unblock has no actor/evidence and may be called by a cron;
+        # only the audited coordinator-promotion path opens this gate.
+        assert not kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.promote_task(conn, tid, actor="coordinator") == (True, None)
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        assert kb.block_task(conn, tid, reason="no confined backend", kind="capability")
+        assert kb.promote_task(conn, tid, actor="coordinator") == (True, None)
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+
+        assert kb.block_task(conn, tid, reason="still no confined backend", kind="capability")
+
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task.status == "blocked"
+    assert _task_to_dict(task)["requires_manual_promotion"] is True
+    assert any(event.kind == "block_loop_manual_review_required" for event in events)
+    assert not any(event.kind == "block_loop_detected" for event in events)
+
+
+def test_initially_blocked_task_is_not_auto_promoted_after_dependencies_clear(
+    kanban_home: Path,
+) -> None:
+    """Recovery must require a fresh explicit promotion, never recompute-ready."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(
+            conn,
+            title="approval-gated-child",
+            assignee="worker",
+            parents=[parent],
+            initial_status="blocked",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_block_can_quarantine_a_todo_task_after_unsafe_graph_mutation(
+    kanban_home: Path,
+) -> None:
+    """The coordinator needs a durable containment operation after fan-out."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="mutated-root", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+
+        assert kb.block_task(conn, tid, reason="containment", kind="needs_input")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_legacy_initial_block_event_backfills_manual_promotion_gate(tmp_path: Path) -> None:
+    """The approval contract survives migration of an already-queued task."""
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, "
+        "created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+        "kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'approval-gated', 'blocked', 1)"
+    )
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES ('legacy', 'blocked', ?, 1)",
+        (json.dumps({"reason": "initial_status_blocked"}),),
+    )
+    conn.commit()
+
+    kb._migrate_add_optional_columns(conn)
+    row = conn.execute(
+        "SELECT requires_manual_promotion FROM tasks WHERE id = 'legacy'"
+    ).fetchone()
+    assert row["requires_manual_promotion"] == 1
+
+    # Reopening the board reruns the additive migration; the backfill must be
+    # harmless and retain the gate.
+    kb._migrate_add_optional_columns(conn)
+    again = conn.execute(
+        "SELECT requires_manual_promotion FROM tasks WHERE id = 'legacy'"
+    ).fetchone()
+    assert again["requires_manual_promotion"] == 1
+    conn.close()
 
 
 # ---------------------------------------------------------------------------

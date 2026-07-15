@@ -915,6 +915,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # An initially blocked task needs an explicit promotion after every
+    # recovery; automated lifecycle transitions must not make it runnable.
+    requires_manual_promotion: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -998,6 +1001,10 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            requires_manual_promotion=(
+                bool(row["requires_manual_promotion"])
+                if "requires_manual_promotion" in keys else False
             ),
         )
 
@@ -1176,7 +1183,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Initially blocked tasks require explicit promotion after recovery.
+    requires_manual_promotion INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1987,6 +1996,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "requires_manual_promotion" not in cols:
+        # Existing approval-gated tasks are identifiable through their durable
+        # initial-block event. Keep the schema change and backfill atomic: a
+        # crash must leave the column absent, not present-but-unbackfilled.
+        # New rows set this directly at creation.
+        with write_txn(conn):
+            _add_column_if_missing(
+                conn,
+                "tasks",
+                "requires_manual_promotion",
+                "requires_manual_promotion INTEGER NOT NULL DEFAULT 0",
+            )
+            rows = conn.execute(
+                "SELECT task_id, payload FROM task_events WHERE kind = 'blocked'"
+            ).fetchall()
+            gated_ids: list[str] = []
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload"] or "null")
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("reason") == "initial_status_blocked"
+                ):
+                    gated_ids.append(row["task_id"])
+            if gated_ids:
+                conn.executemany(
+                    "UPDATE tasks SET requires_manual_promotion = 1 WHERE id = ?",
+                    [(task_id,) for task_id in gated_ids],
+                )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2629,6 +2670,7 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                manual_promotion_required = 1 if initial_status == "blocked" else 0
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2636,8 +2678,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        requires_manual_promotion
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2660,6 +2703,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        manual_promotion_required,
                     ),
                 )
                 for pid in parents:
@@ -3330,12 +3374,17 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, requires_manual_promotion "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if row["requires_manual_promotion"]:
+                # ``promote_task`` is the only exit from an explicit approval
+                # gate. Dependency recovery must never create a fresh spawn
+                # opportunity.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4785,7 +4834,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition a runnable or ``todo`` task to ``blocked`` (or route elsewhere).
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -4820,7 +4869,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, requires_manual_promotion "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -4880,15 +4930,17 @@ def block_task(
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
+        # re-block for the SAME reason after a prior unblock. For a worker it
+        # normally fires from running/ready; the coordinator may also use it
+        # to quarantine an unsafe ``todo`` task after graph recovery. A stored
+        # block_kind that matches the incoming kind therefore preserves the
+        # recurrence evidence rather than silently resetting it.
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
+        requires_manual_promotion = bool(cur_row["requires_manual_promotion"])
 
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
+        if recurrences >= BLOCK_RECURRENCE_LIMIT and not requires_manual_promotion:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
@@ -4901,7 +4953,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'todo')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -4940,7 +4992,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'todo')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -4955,7 +5007,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'todo')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -4975,9 +5027,19 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
+            event_kind = (
+                "block_loop_manual_review_required"
+                if recurrences >= BLOCK_RECURRENCE_LIMIT and requires_manual_promotion
+                else "blocked"
+            )
             _append_event(
-                conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                conn, task_id, event_kind,
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "limit": BLOCK_RECURRENCE_LIMIT,
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -5066,6 +5128,11 @@ def promote_task(
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
+    Tasks created behind an explicit approval gate are deliberately excluded:
+    callers must use :func:`promote_task`, which records the coordinator
+    identity and decision. ``unblock_task`` remains available to generic
+    recovery automation for ordinary tasks.
+
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
     is a no-op. If a future or external write left the pointer dangling,
@@ -5076,9 +5143,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id, requires_manual_promotion FROM tasks "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
+        if stale is None or stale["requires_manual_promotion"]:
+            return False
         if stale and stale["current_run_id"]:
             conn.execute(
                 """
@@ -5220,6 +5290,38 @@ def specify_triage_task(
     return True
 
 
+def withhold_auto_decomposition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str = "requires_manual_promotion",
+) -> bool:
+    """Quarantine a manually gated task that reached triage unexpectedly."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ?
+               AND status = 'triage'
+               AND requires_manual_promotion = 1
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "auto_decomposition_withheld",
+            {"reason": reason},
+        )
+    return True
+
+
 def decompose_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5313,7 +5415,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, requires_manual_promotion "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5321,13 +5423,55 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        if root_row["requires_manual_promotion"]:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'triage'",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "auto_decomposition_withheld",
+                {"reason": "requires_manual_promotion"},
+            )
+            return None
         tenant = root_row["tenant"]
-        # Children inherit the root's workspace by default so a fan-out
-        # of a code-gen task lands in the parent's project dir/worktree
-        # rather than throwaway scratch tmp dirs. A child dict can still
-        # override with its own 'workspace_kind' / 'workspace_path'.
+        # Children inherit ordinary root workspaces by default. A worktree
+        # root is different: every child must name its own isolated worktree.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        if root_ws_kind == "worktree":
+            child_worktrees: list[str] = []
+            root_worktree = (
+                os.path.normcase(os.path.realpath(os.path.expanduser(root_ws_path)))
+                if isinstance(root_ws_path, str) and root_ws_path.strip()
+                else None
+            )
+            for child in children:
+                child_kind = child.get("workspace_kind") or root_ws_kind
+                child_path = child.get("workspace_path")
+                if (
+                    child_kind != "worktree"
+                    or not isinstance(child_path, str)
+                    or not child_path.strip()
+                ):
+                    raise ValueError(
+                        "worktree children must declare distinct isolated workspace paths"
+                    )
+                canonical_path = os.path.normcase(
+                    os.path.realpath(os.path.expanduser(child_path))
+                )
+                if root_worktree is not None and canonical_path == root_worktree:
+                    raise ValueError(
+                        "worktree children must declare distinct isolated workspace paths"
+                    )
+                child_worktrees.append(canonical_path)
+            if len(child_worktrees) != len(set(child_worktrees)):
+                raise ValueError(
+                    "worktree children must declare distinct isolated workspace paths"
+                )
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher

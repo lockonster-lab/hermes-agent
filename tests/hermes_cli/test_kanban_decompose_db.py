@@ -189,6 +189,126 @@ def test_decompose_children_inherit_dir_workspace(kanban_home):
             assert t.workspace_path == proj
 
 
+def test_decompose_rejects_children_that_would_share_a_worktree(kanban_home):
+    """Fan-out must never turn one worktree into concurrent worker scope."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="isolated root",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path="/tmp/root-worktree",
+            triage=True,
+        )
+
+        with pytest.raises(ValueError, match="isolated workspace"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[{"title": "part A"}],
+                author="decomposer",
+            )
+
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.child_ids(conn, tid) == []
+
+
+def test_decompose_rejects_worktree_child_downgrade_to_dir(kanban_home):
+    """A child cannot relabel the parent worktree as an ordinary directory."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="isolated root",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path="/tmp/root-worktree",
+            triage=True,
+        )
+
+        with pytest.raises(ValueError, match="isolated workspace"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[{"title": "part A", "workspace_kind": "dir"}],
+                author="decomposer",
+            )
+
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.child_ids(conn, tid) == []
+
+
+def test_decompose_rejects_explicit_parent_worktree_path(kanban_home):
+    """An explicit path must still be a child worktree, not the root itself."""
+    with kb.connect() as conn:
+        root_path = "/tmp/root-worktree"
+        tid = kb.create_task(
+            conn,
+            title="isolated root",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=root_path,
+            triage=True,
+        )
+
+        with pytest.raises(ValueError, match="isolated workspace"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[
+                    {
+                        "title": "part A",
+                        "workspace_kind": "worktree",
+                        "workspace_path": root_path,
+                    }
+                ],
+                author="decomposer",
+            )
+
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.child_ids(conn, tid) == []
+
+
+def test_decompose_accepts_distinct_explicit_child_worktrees(kanban_home):
+    """An explicitly isolated plan remains usable for manual decomposition."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="isolated root",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path="/tmp/root-worktree",
+            triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "part A",
+                    "workspace_kind": "worktree",
+                    "workspace_path": "/tmp/child-a",
+                },
+                {
+                    "title": "part B",
+                    "workspace_kind": "worktree",
+                    "workspace_path": "/tmp/child-b",
+                },
+            ],
+            author="decomposer",
+            auto_promote=False,
+        )
+
+        assert child_ids is not None
+        children = [kb.get_task(conn, child_id) for child_id in child_ids]
+
+    assert [task.workspace_path for task in children] == ["/tmp/child-a", "/tmp/child-b"]
+    assert all(task.workspace_kind == "worktree" for task in children)
+
+
 def test_decompose_children_stay_scratch_when_root_scratch(kanban_home):
     """No regression: a scratch root still fans out into scratch children."""
     with kb.connect() as conn:

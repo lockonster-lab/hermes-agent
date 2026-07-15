@@ -283,11 +283,24 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        if task is not None and task.requires_manual_promotion:
+            kb.withhold_auto_decomposition(conn, task_id)
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "task requires explicit coordinator promotion before decomposition",
+            )
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if task.workspace_kind == "worktree":
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "worktree task requires an explicit isolated-child workspace plan",
         )
 
     cfg = _load_config()
