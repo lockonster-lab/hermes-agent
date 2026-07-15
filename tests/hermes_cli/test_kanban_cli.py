@@ -253,6 +253,26 @@ def test_run_slash_bootstrap_prepare_emits_json(kanban_home, monkeypatch):
     }
 
 
+def test_run_slash_worktree_preflight_emits_json_without_lifecycle_mutation(
+    kanban_home, monkeypatch,
+):
+    calls = []
+
+    def fake_preflight(conn, task_id):
+        calls.append(task_id)
+        return False, "declared worktree is dirty", "/private/tmp/declared"
+
+    monkeypatch.setattr(kb, "preflight_declared_worktree", fake_preflight)
+    out = kc.run_slash("worktree-preflight t_declared --json")
+    assert calls == ["t_declared"]
+    assert json.loads(out) == {
+        "task_id": "t_declared",
+        "ok": False,
+        "reason": "declared worktree is dirty",
+        "workspace_path": "/private/tmp/declared",
+    }
+
+
 def test_run_slash_promote_json_keeps_execution_mode_visible(kanban_home):
     with kb.connect_closing() as conn:
         task_id = kb.create_task(

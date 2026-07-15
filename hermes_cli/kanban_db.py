@@ -936,6 +936,8 @@ class Task:
     bootstrap_kind: Optional[str] = None
     bootstrap_source_root: Optional[str] = None
     bootstrap_base_revision: Optional[str] = None
+    worktree_source_root: Optional[str] = None
+    worktree_base_revision: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1042,6 +1044,16 @@ class Task:
             bootstrap_base_revision=(
                 row["bootstrap_base_revision"]
                 if "bootstrap_base_revision" in keys and row["bootstrap_base_revision"]
+                else None
+            ),
+            worktree_source_root=(
+                row["worktree_source_root"]
+                if "worktree_source_root" in keys and row["worktree_source_root"]
+                else None
+            ),
+            worktree_base_revision=(
+                row["worktree_base_revision"]
+                if "worktree_base_revision" in keys and row["worktree_base_revision"]
                 else None
             ),
         )
@@ -1243,7 +1255,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Immutable identity for the deliberately narrow self-repair bootstrap.
     bootstrap_kind          TEXT,
     bootstrap_source_root   TEXT,
-    bootstrap_base_revision TEXT
+    bootstrap_base_revision TEXT,
+    worktree_source_root   TEXT,
+    worktree_base_revision TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2106,6 +2120,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "bootstrap_source_root",
             "bootstrap_source_root TEXT",
         )
+    if "worktree_source_root" not in cols:
+        _add_column_if_missing(conn, "tasks", "worktree_source_root", "worktree_source_root TEXT")
+    if "worktree_base_revision" not in cols:
+        _add_column_if_missing(conn, "tasks", "worktree_base_revision", "worktree_base_revision TEXT")
     if "bootstrap_base_revision" not in cols:
         _add_column_if_missing(
             conn,
@@ -2536,6 +2554,8 @@ def create_task(
     bootstrap_kind: Optional[str] = None,
     bootstrap_source_root: Optional[str] = None,
     bootstrap_base_revision: Optional[str] = None,
+    worktree_source_root: Optional[str] = None,
+    worktree_base_revision: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -2591,6 +2611,11 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if workspace_kind == "worktree" and (worktree_source_root or worktree_base_revision):
+        if not workspace_path or not branch_name:
+            raise ValueError("worktree attestation requires an explicit path and branch_name")
+        if not worktree_source_root or not re.fullmatch(r"[0-9a-fA-F]{40}", str(worktree_base_revision)):
+            raise ValueError("worktree attestation requires source root and full 40-character base revision")
 
     bootstrap_fields = (
         bootstrap_source_root,
@@ -2826,8 +2851,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
                         requires_manual_promotion, execution_mode, bootstrap_kind,
-                        bootstrap_source_root, bootstrap_base_revision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        bootstrap_source_root, bootstrap_base_revision,
+                        worktree_source_root, worktree_base_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2855,6 +2881,8 @@ def create_task(
                         bootstrap_kind,
                         bootstrap_source_root,
                         bootstrap_base_revision,
+                        worktree_source_root,
+                        str(worktree_base_revision).lower() if worktree_base_revision else None,
                     ),
                 )
                 for pid in parents:
@@ -3582,6 +3610,14 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    candidates = [
+        get_task(conn, row["id"])
+        for row in conn.execute("SELECT id FROM tasks WHERE status IN ('todo', 'blocked')").fetchall()
+    ]
+    preflight_ok = {
+        task.id for task in candidates
+        if task is not None and _declared_worktree_preflight_error(task) is None
+    }
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -3590,6 +3626,8 @@ def recompute_ready(
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
+            if task_id not in preflight_ok:
+                continue
             cur_status = row["status"]
             if row["requires_manual_promotion"]:
                 # ``promote_task`` is the only exit from an explicit approval
@@ -3645,6 +3683,73 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _declared_worktree_preflight_error(task: Task) -> Optional[str]:
+    """Return a fail-closed release error for an explicit worktree target.
+
+    This check never materializes a worktree.  An incomplete attestation is a
+    release denial, not a request to fall back to ``HEAD`` or a board default.
+    """
+    if task.workspace_kind != "worktree":
+        return None
+    if not task.workspace_path:
+        return "declared worktree is missing"
+    target = Path(task.workspace_path)
+    if not target.is_absolute() or not target.is_dir():
+        return "declared worktree is missing"
+    if not task.worktree_source_root or not task.worktree_base_revision:
+        return "declared worktree lacks immutable source/base attestation"
+    source = Path(task.worktree_source_root)
+    if not source.is_absolute() or not source.is_dir() or not task.branch_name:
+        return "declared worktree attestation is invalid"
+    try:
+        source = source.resolve(strict=True)
+        target = target.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return "declared worktree path cannot be resolved"
+    def git(path: Path, *args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30, check=False, env=_bootstrap_git_env())
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+    if git(source, "rev-parse", "--show-toplevel") != str(source):
+        return "declared worktree source is not its Git top-level"
+    if git(target, "rev-parse", "--show-toplevel") != str(target):
+        return "declared worktree is not its Git top-level"
+    if git(source, "rev-parse", "--path-format=absolute", "--git-common-dir") != git(target, "rev-parse", "--path-format=absolute", "--git-common-dir"):
+        return "declared worktree is not owned by declared source"
+    if git(target, "branch", "--show-current") != task.branch_name:
+        return "declared worktree branch does not match"
+    if git(target, "rev-parse", "HEAD^{commit}") != task.worktree_base_revision:
+        return "declared worktree base revision does not match"
+    if git(source, "rev-parse", "HEAD^{commit}") != task.worktree_base_revision:
+        return "declared worktree source revision does not match"
+    if git(target, "status", "--porcelain=v1", "--untracked-files=all"):
+        return "declared worktree is dirty"
+    return None
+
+
+def preflight_declared_worktree(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    """Validate one declared worktree without mutating task/run state."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, f"task {task_id!r} not found", None
+    error = _declared_worktree_preflight_error(task)
+    if error:
+        return False, error, task.workspace_path
+    if task.workspace_kind != "worktree":
+        return True, None, task.workspace_path
+    # The preflight validates the resolved filesystem identity.  Returning
+    # the raw declaration here would let a dry-run/CLI consumer report an
+    # alias rather than the worktree it actually admitted.
+    try:
+        return True, None, str(Path(task.workspace_path).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False, "declared worktree path cannot be resolved", task.workspace_path
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3657,10 +3762,23 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    candidate = get_task(conn, task_id)
+    snapshot = None
+    if candidate is not None and candidate.status == "ready":
+        preflight_error = _declared_worktree_preflight_error(candidate)
+        if preflight_error:
+            with write_txn(conn):
+                _append_event(conn, task_id, "claim_rejected", {"reason": preflight_error})
+            return None
+        snapshot = (candidate.workspace_path, candidate.branch_name, candidate.worktree_source_root, candidate.worktree_base_revision)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        current = get_task(conn, task_id)
+        if snapshot is not None and current is not None and snapshot != (current.workspace_path, current.branch_name, current.worktree_source_root, current.worktree_base_revision):
+            _append_event(conn, task_id, "claim_rejected", {"reason": "declared worktree attestation changed during claim"})
+            return None
         mode_row = conn.execute(
             "SELECT execution_mode FROM tasks "
             "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
@@ -3804,10 +3922,23 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    candidate = get_task(conn, task_id)
+    snapshot = None
+    if candidate is not None and candidate.status == "review":
+        error = _declared_worktree_preflight_error(candidate)
+        if error:
+            with write_txn(conn):
+                _append_event(conn, task_id, "claim_rejected", {"reason": error, "source_status": "review"})
+            return None
+        snapshot = (candidate.workspace_path, candidate.branch_name, candidate.worktree_source_root, candidate.worktree_base_revision)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        current = get_task(conn, task_id)
+        if snapshot is not None and current is not None and snapshot != (current.workspace_path, current.branch_name, current.worktree_source_root, current.worktree_base_revision):
+            _append_event(conn, task_id, "claim_rejected", {"reason": "declared worktree attestation changed during claim", "source_status": "review"})
+            return None
         mode_row = conn.execute(
             "SELECT execution_mode FROM tasks "
             "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
@@ -5334,6 +5465,12 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    task = get_task(conn, task_id)
+    assert task is not None
+    preflight_error = _declared_worktree_preflight_error(task)
+    if preflight_error:
+        return False, preflight_error
+
     if not force:
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
@@ -5387,6 +5524,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    candidate = get_task(conn, task_id)
+    if candidate is not None and _declared_worktree_preflight_error(candidate):
+        return False
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -6994,15 +7134,15 @@ def set_workspace_path(
     value = str(path)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT bootstrap_kind, workspace_path FROM tasks WHERE id = ?",
+            "SELECT bootstrap_kind, worktree_source_root, workspace_path FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if (
             row
-            and row["bootstrap_kind"] is not None
+            and (row["bootstrap_kind"] is not None or row["worktree_source_root"] is not None)
             and row["workspace_path"] != value
         ):
-            raise ValueError("bootstrap workspace identity is immutable")
+            raise ValueError("declared worktree identity is immutable")
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (value, task_id),
@@ -7015,15 +7155,15 @@ def set_branch_name(
     value = str(branch_name)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT bootstrap_kind, branch_name FROM tasks WHERE id = ?",
+            "SELECT bootstrap_kind, worktree_source_root, branch_name FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if (
             row
-            and row["bootstrap_kind"] is not None
+            and (row["bootstrap_kind"] is not None or row["worktree_source_root"] is not None)
             and row["branch_name"] != value
         ):
-            raise ValueError("bootstrap branch identity is immutable")
+            raise ValueError("declared worktree identity is immutable")
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (value, task_id),
@@ -7162,6 +7302,9 @@ class DispatchResult:
     They remain visible in the queue but never reach claim, workspace
     resolution, or subprocess spawn.
     """
+    skipped_worktree_preflight: list[str] = field(default_factory=list)
+    """Worker tasks withheld because their declared worktree failed the
+    same non-mutating admission check used by claim/release paths."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8895,7 +9038,13 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
+            preflight_ok, _reason, workspace = preflight_declared_worktree(
+                conn, row["id"]
+            )
+            if not preflight_ok:
+                result.skipped_worktree_preflight.append(row["id"])
+                continue
+            result.spawned.append((row["id"], row_assignee, workspace or ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -9000,7 +9149,13 @@ def _dispatch_once_locked(
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            preflight_ok, _reason, workspace = preflight_declared_worktree(
+                conn, row["id"]
+            )
+            if not preflight_ok:
+                result.skipped_worktree_preflight.append(row["id"])
+                continue
+            result.spawned.append((row["id"], row["assignee"], workspace or ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:

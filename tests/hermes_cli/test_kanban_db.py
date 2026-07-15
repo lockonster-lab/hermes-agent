@@ -2265,7 +2265,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     assert f"branch refs/heads/{branch}" in listed
 
 
-def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanban_home, tmp_path, monkeypatch):
+def test_dispatch_rejects_legacy_worktree_without_immutable_attestation(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     kb.create_board("worktree-board", default_workdir=str(repo))
@@ -2289,22 +2289,18 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         task = kb.get_task(conn, tid)
 
     expected = repo / ".worktrees" / tid
-    assert result.spawned == [(tid, "sentinel", str(expected))]
-    assert spawns == [(tid, str(expected))]
+    assert result.spawned == []
+    assert spawns == []
     assert task is not None
-    assert task.workspace_path == str(expected)
-    assert task.branch_name == f"wt/{tid}"
-    listed = subprocess.run(
-        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert f"worktree {expected}" in listed
-    assert f"branch refs/heads/wt/{tid}" in listed
+    assert task.status == "ready"
+    # Board defaults may be recorded as a declaration, but are not an
+    # attested linked worktree and must never be materialized by dispatch.
+    assert task.workspace_path == str(repo)
+    assert task.branch_name is None
+    assert not expected.exists()
 
 
-def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
+def test_dispatch_repeatedly_refuses_legacy_worktree_without_materialization(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     kb.create_board("worktree-rerun-board", default_workdir=str(repo))
@@ -2325,43 +2321,20 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
             board="worktree-rerun-board",
         )
         first = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
-        first_task = kb.get_task(conn, tid)
-        assert first_task is not None
         expected = repo / ".worktrees" / tid
-        assert first_task.workspace_path == str(expected)
-        assert first_task.branch_name == f"wt/{tid}"
-
-        conn.execute(
-            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
-            (tid,),
-        )
-        conn.commit()
-
         second = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
         second_task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
 
-    assert first.spawned == [(tid, "sentinel", str(expected))]
-    assert second.spawned == [(tid, "sentinel", str(expected))]
-    assert spawns == [(tid, str(expected)), (tid, str(expected))]
+    assert first.spawned == []
+    assert second.spawned == []
+    assert spawns == []
     assert second_task is not None
-    assert second_task.workspace_path == str(expected)
-    actual_branch = subprocess.run(
-        ["git", "-C", str(expected), "branch", "--show-current"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert actual_branch == f"wt/{tid}"
-    assert second_task.branch_name == actual_branch
-    listed = subprocess.run(
-        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert listed.count(f"worktree {expected}\n") == 1
-    assert f"worktree {expected}/.worktrees/{tid}" not in listed
-    assert f"branch refs/heads/{actual_branch}" in listed
+    assert second_task.status == "ready"
+    assert second_task.workspace_path == str(repo)
+    assert second_task.branch_name is None
+    assert not expected.exists()
+    assert [event.kind for event in events].count("claim_rejected") == 2
 
 
 # ---------------------------------------------------------------------------
