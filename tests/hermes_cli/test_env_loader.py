@@ -86,6 +86,65 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
 
 
+def test_confined_kanban_dispatch_environment_survives_profile_dotenv(tmp_path, monkeypatch):
+    """Profile config must not downgrade dispatcher-owned worker confinement."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    env_file = home / ".env"
+    env_file.write_text(
+        "TERMINAL_ENV=local\n"
+        "TERMINAL_CWD=/profile-local-cwd\n"
+        "HERMES_KANBAN_TASK=profile-task\n",
+        encoding="utf-8",
+    )
+    expected = {
+        "HERMES_KANBAN_CONFINEMENT": "1",
+        "HERMES_KANBAN_TASK": "t_confined",
+        "HERMES_KANBAN_WORKSPACE": "/canonical/worktree",
+        "HERMES_KANBAN_DB": "/canonical/kanban.db",
+        "TERMINAL_ENV": "docker",
+        "TERMINAL_CWD": "/canonical/worktree",
+    }
+    for key, value in expected.items():
+        monkeypatch.setenv(key, value)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    for key, value in expected.items():
+        assert os.environ[key] == value
+
+
+def test_unmarked_session_keeps_normal_profile_terminal_precedence(tmp_path, monkeypatch):
+    """The confinement exception must not change ordinary profile behavior."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text("TERMINAL_ENV=local\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_KANBAN_CONFINEMENT", raising=False)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["TERMINAL_ENV"] == "local"
+
+
+def test_main_bootstrap_preserves_confined_dispatch_environment(tmp_path, monkeypatch):
+    """The actual CLI bootstrap keeps dispatcher confinement after profile dotenv."""
+    home = tmp_path / "profiles" / "default"
+    home.mkdir(parents=True)
+    (home / ".env").write_text("TERMINAL_ENV=local\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_CONFINEMENT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bootstrap")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/canonical/worktree")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    sys.modules.pop("hermes_cli.main", None)
+    importlib.import_module("hermes_cli.main")
+
+    assert os.environ["TERMINAL_ENV"] == "docker"
+    assert os.environ["HERMES_KANBAN_TASK"] == "t_bootstrap"
+
+
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()

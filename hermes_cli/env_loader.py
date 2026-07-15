@@ -39,6 +39,29 @@ _SECRET_SOURCES: dict[str, str] = {}
 _APPLIED_HOMES: set[str] = set()
 
 
+def _capture_dispatch_confinement_env() -> dict[str, str]:
+    """Capture worker-only env values that profile dotenv must not override.
+
+    A Kanban dispatcher injects this marker and its task identity before the
+    child imports Hermes.  Profile ``.env`` intentionally overrides ordinary
+    shell values, but doing so for a marked worker can downgrade Docker-only
+    containment to a host-local terminal after the dispatcher has already
+    passed its preflight.  Keep the exception narrow: normal sessions retain
+    the established profile dotenv precedence.
+    """
+    if os.environ.get("HERMES_KANBAN_CONFINEMENT") != "1":
+        return {}
+    preserved = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("HERMES_KANBAN_")
+    }
+    for key in ("TERMINAL_ENV", "TERMINAL_CWD"):
+        if key in os.environ:
+            preserved[key] = os.environ[key]
+    return preserved
+
+
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
 
@@ -231,6 +254,7 @@ def load_hermes_dotenv(
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
     loaded: list[Path] = []
+    dispatch_confinement_env = _capture_dispatch_confinement_env()
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
@@ -266,6 +290,11 @@ def load_hermes_dotenv(
 
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
+    # Re-assert dispatcher-owned worker confinement after every source that
+    # deliberately overrides normal session environment.  In particular this
+    # prevents a profile `.env` from replacing TERMINAL_ENV=docker with local.
+    if dispatch_confinement_env:
+        os.environ.update(dispatch_confinement_env)
 
     return loaded
 
