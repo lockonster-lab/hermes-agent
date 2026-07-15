@@ -3737,7 +3737,17 @@ def preflight_declared_worktree(
     if task is None:
         return False, f"task {task_id!r} not found", None
     error = _declared_worktree_preflight_error(task)
-    return not bool(error), error, task.workspace_path
+    if error:
+        return False, error, task.workspace_path
+    if task.workspace_kind != "worktree":
+        return True, None, task.workspace_path
+    # The preflight validates the resolved filesystem identity.  Returning
+    # the raw declaration here would let a dry-run/CLI consumer report an
+    # alias rather than the worktree it actually admitted.
+    try:
+        return True, None, str(Path(task.workspace_path).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False, "declared worktree path cannot be resolved", task.workspace_path
 
 
 def claim_task(
@@ -7292,6 +7302,9 @@ class DispatchResult:
     They remain visible in the queue but never reach claim, workspace
     resolution, or subprocess spawn.
     """
+    skipped_worktree_preflight: list[str] = field(default_factory=list)
+    """Worker tasks withheld because their declared worktree failed the
+    same non-mutating admission check used by claim/release paths."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9025,7 +9038,13 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
+            preflight_ok, _reason, workspace = preflight_declared_worktree(
+                conn, row["id"]
+            )
+            if not preflight_ok:
+                result.skipped_worktree_preflight.append(row["id"])
+                continue
+            result.spawned.append((row["id"], row_assignee, workspace or ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -9130,7 +9149,13 @@ def _dispatch_once_locked(
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            preflight_ok, _reason, workspace = preflight_declared_worktree(
+                conn, row["id"]
+            )
+            if not preflight_ok:
+                result.skipped_worktree_preflight.append(row["id"])
+                continue
+            result.spawned.append((row["id"], row["assignee"], workspace or ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
