@@ -101,6 +101,12 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+EXECUTION_MODE_WORKER = "worker"
+EXECUTION_MODE_COORDINATOR_ONLY = "coordinator_only"
+VALID_EXECUTION_MODES = {
+    EXECUTION_MODE_WORKER,
+    EXECUTION_MODE_COORDINATOR_ONLY,
+}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -918,6 +924,10 @@ class Task:
     # An initially blocked task needs an explicit promotion after every
     # recovery; automated lifecycle transitions must not make it runnable.
     requires_manual_promotion: bool = False
+    # ``coordinator_only`` tasks are durable TaskContract control-plane work.
+    # They may be promoted for visibility, but no generic worker may claim or
+    # spawn them. ``worker`` preserves the legacy/default lifecycle.
+    execution_mode: str = EXECUTION_MODE_WORKER
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1005,6 +1015,11 @@ class Task:
             requires_manual_promotion=(
                 bool(row["requires_manual_promotion"])
                 if "requires_manual_promotion" in keys else False
+            ),
+            execution_mode=(
+                row["execution_mode"]
+                if "execution_mode" in keys and row["execution_mode"]
+                else EXECUTION_MODE_WORKER
             ),
         )
 
@@ -1185,7 +1200,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Initially blocked tasks require explicit promotion after recovery.
-    requires_manual_promotion INTEGER NOT NULL DEFAULT 0
+    requires_manual_promotion INTEGER NOT NULL DEFAULT 0,
+    -- Durable TaskContract execution boundary. Coordinator-only tasks never
+    -- enter a worker claim/workspace/Popen lifecycle.
+    execution_mode       TEXT NOT NULL DEFAULT 'worker'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2028,6 +2046,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     [(task_id,) for task_id in gated_ids],
                 )
 
+    if "execution_mode" not in cols:
+        # SQLite applies the default to every historic row atomically. Legacy
+        # tasks therefore retain their prior worker lifecycle explicitly;
+        # nothing is silently upgraded into a coordinator-only task.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "execution_mode",
+            "execution_mode TEXT NOT NULL DEFAULT 'worker'",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2446,6 +2475,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    execution_mode: str = EXECUTION_MODE_WORKER,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -2479,6 +2509,18 @@ def create_task(
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
+        )
+    if execution_mode not in VALID_EXECUTION_MODES:
+        raise ValueError(
+            f"execution_mode must be one of {sorted(VALID_EXECUTION_MODES)}, "
+            f"got {execution_mode!r}"
+        )
+    if (
+        execution_mode == EXECUTION_MODE_COORDINATOR_ONLY
+        and initial_status != "blocked"
+    ):
+        raise ValueError(
+            "coordinator_only tasks require initial_status='blocked'"
         )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
@@ -2679,8 +2721,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        requires_manual_promotion
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        requires_manual_promotion, execution_mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2704,6 +2746,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         manual_promotion_required,
+                        execution_mode,
                     ),
                 )
                 for pid in parents:
@@ -2723,6 +2766,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "execution_mode": execution_mode,
                     },
                 )
                 if initial_status == "blocked":
@@ -2747,6 +2791,64 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def set_coordinator_only(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> tuple[bool, Optional[str]]:
+    """Enroll one blocked, manual-gated legacy task into no-worker mode.
+
+    This is intentionally one-way: the public API never restores ``worker``
+    mode. A task must still be blocked, manually gated, and have no execution
+    attempts, so the operation records a coordinator decision before any
+    worker lifecycle can begin rather than repairing history after a spawn.
+    """
+    actor = actor.strip()
+    reason = reason.strip()
+    if not actor:
+        return False, "actor is required"
+    if not reason:
+        return False, "reason is required"
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, requires_manual_promotion, execution_mode "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id!r} not found"
+        if row["execution_mode"] != EXECUTION_MODE_WORKER:
+            return False, "execution mode is already immutable"
+        if row["status"] != "blocked":
+            return False, "coordinator-only enrollment requires blocked status"
+        if not row["requires_manual_promotion"]:
+            return False, "coordinator-only enrollment requires a manual gate"
+        prior_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)
+        ).fetchone()
+        if prior_run is not None:
+            return False, "coordinator-only enrollment refuses tasks with prior runs"
+
+        conn.execute(
+            "UPDATE tasks SET execution_mode = ? WHERE id = ?",
+            (EXECUTION_MODE_COORDINATOR_ONLY, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "coordinator_only_enrolled",
+            {
+                "actor": actor,
+                "reason": reason,
+                "previous_execution_mode": EXECUTION_MODE_WORKER,
+            },
+        )
+    return True, None
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -3450,6 +3552,24 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        mode_row = conn.execute(
+            "SELECT execution_mode FROM tasks "
+            "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if mode_row is not None and mode_row["execution_mode"] != EXECUTION_MODE_WORKER:
+            refusal_kind = (
+                "claim_refused_coordinator_only"
+                if mode_row["execution_mode"] == EXECUTION_MODE_COORDINATOR_ONLY
+                else "claim_refused_non_worker_execution_mode"
+            )
+            _append_event(
+                conn,
+                task_id,
+                refusal_kind,
+                {"execution_mode": mode_row["execution_mode"]},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3579,6 +3699,24 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        mode_row = conn.execute(
+            "SELECT execution_mode FROM tasks "
+            "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if mode_row is not None and mode_row["execution_mode"] != EXECUTION_MODE_WORKER:
+            refusal_kind = (
+                "claim_refused_coordinator_only"
+                if mode_row["execution_mode"] == EXECUTION_MODE_COORDINATOR_ONLY
+                else "claim_refused_non_worker_execution_mode"
+            )
+            _append_event(
+                conn,
+                task_id,
+                refusal_kind,
+                {"execution_mode": mode_row["execution_mode"]},
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6093,6 +6231,12 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_coordinator_only: list[str] = field(default_factory=list)
+    """Tasks whose durable TaskContract permits coordinator work only.
+
+    They remain visible in the queue but never reach claim, workspace
+    resolution, or subprocess spawn.
+    """
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -6127,6 +6271,26 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+
+
+def _record_coordinator_only_dispatch_refusal(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    """Persist one refusal per stable coordinator-only task state."""
+    with write_txn(conn):
+        last = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if last is not None and last["kind"] == "dispatch_refused_coordinator_only":
+            return
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_refused_coordinator_only",
+            {"execution_mode": EXECUTION_MODE_COORDINATOR_ONLY},
+        )
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7290,7 +7454,9 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        "    AND execution_mode = ?",
+        (EXECUTION_MODE_WORKER,),
     ).fetchall()
     if not rows:
         return False
@@ -7316,7 +7482,9 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        "    AND execution_mode = ?",
+        (EXECUTION_MODE_WORKER,),
     ).fetchall()
     if not rows:
         return False
@@ -7483,7 +7651,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, execution_mode FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7541,6 +7709,11 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if row["execution_mode"] != EXECUTION_MODE_WORKER:
+            result.skipped_coordinator_only.append(row["id"])
+            if not dry_run:
+                _record_coordinator_only_dispatch_refusal(conn, row["id"])
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -7725,13 +7898,18 @@ def _dispatch_once_locked(
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, execution_mode FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if row["execution_mode"] != EXECUTION_MODE_WORKER:
+            result.skipped_coordinator_only.append(row["id"])
+            if not dry_run:
+                _record_coordinator_only_dispatch_refusal(conn, row["id"])
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue

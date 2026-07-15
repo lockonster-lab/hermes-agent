@@ -81,6 +81,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
         "requires_manual_promotion": t.requires_manual_promotion,
+        "execution_mode": t.execution_mode,
     }
 
 
@@ -367,7 +368,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument(
+        "--execution-mode",
+        choices=sorted(kb.VALID_EXECUTION_MODES),
+        default=kb.EXECUTION_MODE_WORKER,
+        help="TaskContract execution mode. coordinator_only requires "
+             "--initial-status blocked and is never worker-dispatched.",
+    )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- coordinator-only ---
+    p_coordinator_only = sub.add_parser(
+        "coordinator-only",
+        help="Irreversibly enroll one blocked, manual-gated task as no-worker",
+    )
+    p_coordinator_only.add_argument("task_id")
+    p_coordinator_only.add_argument(
+        "reason",
+        nargs="+",
+        help="Recorded reason for the one-way coordinator-only enrollment",
+    )
+    p_coordinator_only.add_argument("--json", action="store_true")
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -958,6 +979,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "coordinator-only": _cmd_coordinator_only,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -1348,6 +1370,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            execution_mode=getattr(args, "execution_mode", kb.EXECUTION_MODE_WORKER),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2042,9 +2065,11 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 force=bool(args.force),
                 dry_run=bool(args.dry_run),
             )
+            task = kb.get_task(conn, tid)
             results.append({
                 "task_id": tid,
                 "promoted": ok,
+                "execution_mode": task.execution_mode if task else None,
                 "dry_run": bool(args.dry_run),
                 "forced": bool(args.force),
                 "reason": reason,
@@ -2067,6 +2092,33 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_coordinator_only(args: argparse.Namespace) -> int:
+    """Record the narrow, irreversible no-worker enrollment transition."""
+    reason = " ".join(args.reason).strip()
+    actor = _profile_author()
+    with kb.connect_closing() as conn:
+        enrolled, error = kb.set_coordinator_only(
+            conn,
+            args.task_id,
+            actor=actor,
+            reason=reason,
+        )
+        task = kb.get_task(conn, args.task_id)
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "task_id": args.task_id,
+            "enrolled": enrolled,
+            "execution_mode": task.execution_mode if task else None,
+            "error": error,
+        }, indent=2, ensure_ascii=False))
+    elif enrolled:
+        print(f"Enrolled {args.task_id} as coordinator_only")
+    else:
+        print(f"cannot enroll {args.task_id}: {error}", file=sys.stderr)
+    return 0 if enrolled else 1
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:
@@ -2177,6 +2229,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_coordinator_only": res.skipped_coordinator_only,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped

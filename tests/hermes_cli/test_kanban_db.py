@@ -1689,6 +1689,24 @@ def test_has_spawnable_ready_false_when_only_terminal_lanes(kanban_home, monkeyp
         assert kb.has_spawnable_ready(conn) is False
 
 
+def test_has_spawnable_ready_false_for_coordinator_only_task(
+    kanban_home, monkeypatch
+):
+    """Coordinator-only work must not trigger the worker-stuck warning."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="coordinator task",
+            assignee="coordinator",
+            execution_mode="coordinator_only",
+            initial_status="blocked",
+        )
+        assert kb.promote_task(conn, task_id, actor="coordinator") == (True, None)
+        assert kb.has_spawnable_ready(conn) is False
+
+
 def test_has_spawnable_ready_true_when_real_profile_present(kanban_home, monkeypatch):
     """``has_spawnable_ready`` returns True as soon as ANY ready task
     has an assignee that maps to a real Hermes profile — preserves the
@@ -4006,6 +4024,24 @@ def test_has_spawnable_review_false_when_only_terminal_lanes(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review", assignee="orion-cc")
         _set_task_status(conn, t, "review")
+        assert kb.has_spawnable_review(conn) is False
+
+
+def test_has_spawnable_review_false_for_coordinator_only_task(
+    kanban_home, monkeypatch
+):
+    """Review telemetry also excludes durable no-worker contracts."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="coordinator review",
+            assignee="coordinator",
+            execution_mode="coordinator_only",
+            initial_status="blocked",
+        )
+        _set_task_status(conn, task_id, "review")
         assert kb.has_spawnable_review(conn) is False
 
 

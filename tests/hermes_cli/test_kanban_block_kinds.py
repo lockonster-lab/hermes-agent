@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -239,6 +240,184 @@ def test_legacy_initial_block_event_backfills_manual_promotion_gate(tmp_path: Pa
     ).fetchone()
     assert again["requires_manual_promotion"] == 1
     conn.close()
+
+
+def test_legacy_task_backfills_worker_execution_mode(tmp_path: Path) -> None:
+    """A missing mode on a historic row remains explicitly worker-dispatched."""
+    db_path = tmp_path / "legacy-execution-mode.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, "
+        "created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE task_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+        "kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'historic worker task', 'ready', 1)"
+    )
+    conn.commit()
+
+    kb._migrate_add_optional_columns(conn)
+    row = conn.execute(
+        "SELECT execution_mode FROM tasks WHERE id = 'legacy'"
+    ).fetchone()
+
+    assert row["execution_mode"] == "worker"
+    conn.close()
+
+
+def test_coordinator_only_requires_initial_manual_block(kanban_home: Path) -> None:
+    """A no-worker contract cannot enter the generic ready queue at creation."""
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="initial_status='blocked'"):
+            kb.create_task(
+                conn,
+                title="coordinator task",
+                assignee="worker",
+                execution_mode="coordinator_only",
+            )
+
+
+def test_coordinator_only_manual_promotion_refuses_dispatch_before_popen(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manual promotion must not let a coordinator-only task reach Popen."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    popen_calls: list[tuple[object, ...]] = []
+
+    def popen_sentinel(*args, **kwargs):
+        popen_calls.append(args)
+        raise AssertionError("coordinator-only task reached subprocess.Popen")
+
+    monkeypatch.setattr(subprocess, "Popen", popen_sentinel)
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="no worker",
+            assignee="worker",
+            execution_mode="coordinator_only",
+            initial_status="blocked",
+        )
+        assert kb.promote_task(conn, tid, actor="coordinator") == (True, None)
+
+        result = kb.dispatch_once(conn)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result.skipped_coordinator_only == [tid]
+    assert task is not None
+    assert task.status == "ready"
+    assert task.workspace_path is None
+    assert not popen_calls
+    assert not any(event.kind == "claimed" for event in events)
+    refusal = [event for event in events if event.kind == "dispatch_refused_coordinator_only"]
+    assert len(refusal) == 1
+    assert refusal[0].payload == {"execution_mode": "coordinator_only"}
+
+
+def test_coordinator_only_refuses_direct_claim_after_manual_promotion(
+    kanban_home: Path,
+) -> None:
+    """The public claim primitive cannot bypass the dispatcher admission gate."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="no direct worker claim",
+            assignee="worker",
+            execution_mode="coordinator_only",
+            initial_status="blocked",
+        )
+        assert kb.promote_task(conn, tid, actor="coordinator") == (True, None)
+
+        assert kb.claim_task(conn, tid, claimer="worker") is None
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task is not None
+    assert task.status == "ready"
+    assert not task.current_run_id
+    refusal = [event for event in events if event.kind == "claim_refused_coordinator_only"]
+    assert len(refusal) == 1
+    assert refusal[0].payload == {"execution_mode": "coordinator_only"}
+
+
+def test_coordinator_only_review_never_claims_or_spawns(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The separate review-worker path is covered by the same hard gate."""
+    popen_calls: list[tuple[object, ...]] = []
+
+    def popen_sentinel(*args, **kwargs):
+        popen_calls.append(args)
+        raise AssertionError("coordinator-only review reached subprocess.Popen")
+
+    monkeypatch.setattr(subprocess, "Popen", popen_sentinel)
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="no review worker",
+            assignee="reviewer",
+            execution_mode="coordinator_only",
+            initial_status="blocked",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+
+        assert kb.claim_review_task(conn, tid, claimer="reviewer") is None
+        result = kb.dispatch_once(conn)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert result.skipped_coordinator_only == [tid]
+    assert task is not None
+    assert task.status == "review"
+    assert not task.current_run_id
+    assert not popen_calls
+    assert any(event.kind == "claim_refused_coordinator_only" for event in events)
+    assert any(event.kind == "dispatch_refused_coordinator_only" for event in events)
+
+
+def test_blocked_manual_task_can_be_enrolled_coordinator_only_once(
+    kanban_home: Path,
+) -> None:
+    """The bootstrap enrollment is one-way, blocked-only, and auditable."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="legacy coordinator task",
+            assignee="worker",
+            initial_status="blocked",
+        )
+
+        ok, error = kb.set_coordinator_only(
+            conn,
+            tid,
+            actor="coordinator",
+            reason="recorded bootstrap exception",
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert (ok, error) == (True, None)
+    assert task is not None
+    assert task.execution_mode == "coordinator_only"
+    enrollment = [event for event in events if event.kind == "coordinator_only_enrolled"]
+    assert len(enrollment) == 1
+    assert enrollment[0].payload == {
+        "actor": "coordinator",
+        "reason": "recorded bootstrap exception",
+        "previous_execution_mode": "worker",
+    }
 
 
 # ---------------------------------------------------------------------------

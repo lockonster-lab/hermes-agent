@@ -167,6 +167,73 @@ def test_run_slash_json_output(kanban_home):
     assert payload["status"] == "ready"
 
 
+def test_run_slash_enrolls_legacy_blocked_task_as_coordinator_only(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="bootstrap enrollment",
+            assignee="alice",
+            initial_status="blocked",
+        )
+
+    out = kc.run_slash(
+        f"coordinator-only {task_id} recorded bootstrap exception --json"
+    )
+    payload = json.loads(out)
+
+    assert payload["task_id"] == task_id
+    assert payload["execution_mode"] == "coordinator_only"
+    assert payload["enrolled"] is True
+
+
+def test_run_slash_create_and_show_make_execution_mode_visible(kanban_home):
+    out = kc.run_slash(
+        "create 'coordinator contract' --assignee alice "
+        "--initial-status blocked --execution-mode coordinator_only --json"
+    )
+    created = json.loads(out)
+
+    assert created["execution_mode"] == "coordinator_only"
+    assert created["status"] == "blocked"
+
+    shown = json.loads(kc.run_slash(f"show {created['id']} --json"))
+    assert shown["task"]["execution_mode"] == "coordinator_only"
+
+
+def test_run_slash_promote_json_keeps_execution_mode_visible(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="coordinator promotion visibility",
+            assignee="alice",
+            execution_mode="coordinator_only",
+            initial_status="blocked",
+        )
+
+    out = kc.run_slash(f"promote {task_id} coordinator approval --json")
+    payload = json.loads(out)
+
+    assert payload["task_id"] == task_id
+    assert payload["promoted"] is True
+    assert payload["execution_mode"] == "coordinator_only"
+
+
+def test_run_slash_dispatch_json_reports_coordinator_only_skip(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="coordinator dispatch visibility",
+            assignee="alice",
+            execution_mode="coordinator_only",
+            initial_status="blocked",
+        )
+        assert kb.promote_task(conn, task_id, actor="coordinator") == (True, None)
+
+    payload = json.loads(kc.run_slash("dispatch --dry-run --json"))
+    assert payload["spawned"] == []
+    assert payload["skipped_coordinator_only"] == [task_id]
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")
