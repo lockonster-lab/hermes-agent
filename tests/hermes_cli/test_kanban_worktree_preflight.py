@@ -144,8 +144,9 @@ def test_preflight_returns_canonical_verified_worktree_path(
     assert workspace == str(target.resolve())
 
 
+@pytest.mark.parametrize("status", ["ready", "review"])
 def test_dry_run_skips_invalid_worktree_before_reporting_spawnable(
-    kanban_home, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    kanban_home, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str,
 ) -> None:
     """Dry-run is non-mutating but must not advertise an invalid target."""
     from hermes_cli import profiles
@@ -161,13 +162,50 @@ def test_dry_run_skips_invalid_worktree_before_reporting_spawnable(
             workspace_path=str(missing),
             branch_name="wt/missing",
         )
+        if status == "review":
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
         result = kb.dispatch_once(conn, dry_run=True)
         task = kb.get_task(conn, task_id)
         runs = kb.list_runs(conn, task_id)
 
     assert task_id in result.skipped_worktree_preflight
     assert result.spawned == []
-    assert task is not None and task.status == "ready"
+    assert task is not None and task.status == status
+    assert runs == []
+
+
+@pytest.mark.parametrize("status", ["ready", "review"])
+def test_dry_run_reports_canonical_valid_worktree_without_mutation(
+    kanban_home, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str,
+) -> None:
+    """Both dispatch queues expose only the exact worktree they verified."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _: True)
+    source, target, base = _linked_worktree(tmp_path)
+    alias = tmp_path / "declared-alias"
+    alias.symlink_to(target, target_is_directory=True)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="valid dry-run target",
+            assignee="test-profile",
+            workspace_kind="worktree",
+            workspace_path=str(alias),
+            branch_name="wt/preflight",
+            worktree_source_root=str(source),
+            worktree_base_revision=base,
+        )
+        if status == "review":
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        result = kb.dispatch_once(conn, dry_run=True)
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert result.skipped_worktree_preflight == []
+    assert result.spawned == [(task_id, "test-profile", str(target.resolve()))]
+    assert task is not None and task.status == status
+    assert task.worker_pid is None
     assert runs == []
 
 
