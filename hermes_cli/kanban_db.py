@@ -3645,6 +3645,23 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _declared_worktree_preflight_error(task: Task) -> Optional[str]:
+    """Return a fail-closed release error for an explicit worktree target.
+
+    This first #31 gate deliberately verifies only target existence.  Branch,
+    source and base attestation are added by the subsequent contract slice;
+    a missing target must never reach a ready or claimed worker lifecycle.
+    """
+    if task.workspace_kind != "worktree":
+        return None
+    if not task.workspace_path:
+        return "declared worktree is missing"
+    target = Path(task.workspace_path)
+    if not target.is_absolute() or not target.is_dir():
+        return "declared worktree is missing"
+    return None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3661,6 +3678,14 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        candidate = get_task(conn, task_id)
+        if candidate is not None and candidate.status == "ready":
+            preflight_error = _declared_worktree_preflight_error(candidate)
+            if preflight_error:
+                _append_event(
+                    conn, task_id, "claim_rejected", {"reason": preflight_error}
+                )
+                return None
         mode_row = conn.execute(
             "SELECT execution_mode FROM tasks "
             "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
@@ -5333,6 +5358,12 @@ def promote_task(
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+
+    task = get_task(conn, task_id)
+    assert task is not None
+    preflight_error = _declared_worktree_preflight_error(task)
+    if preflight_error:
+        return False, preflight_error
 
     if not force:
         parents = conn.execute(
