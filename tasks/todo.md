@@ -6,6 +6,6 @@
 - [x] Implement fail-closed isolated terminal and file-backend configuration.
 - [x] Implement canonical host/container file-path containment and symlink checks.
 - [x] Disable automatic auxiliary Docker mounts and network-capable toolsets.
-- [x] Run focused `scripts/run_tests.sh` checks (350 passed).
+- [x] Run focused `scripts/run_tests.sh` checks (351 passed).
 - [x] Attempt broader suite; record independent async-plugin environment blocker as #44.
 - [ ] Complete final diff review, local integration, and evidence updates in Hermes task `t_73ec4bfa` and GitHub #43.

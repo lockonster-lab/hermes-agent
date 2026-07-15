@@ -12,6 +12,8 @@ an isolated, air-gapped container that mounts only that worktree.
   not as a security boundary.
 - Make `HERMES_KANBAN_CONFINEMENT=1` a dispatcher-owned worker capability
   marker.  Only `_default_spawn` sets it.
+- Pin dispatcher-spawned workers to `TERMINAL_ENV=docker`; global interactive
+  terminal settings never downgrade their execution contract.
 - In a marked session, refuse the local terminal backend.  Docker is the sole
   supported execution path because it can receive a per-task host mount and
   disabled network; unavailable Docker is a blocker, never a host fallback.

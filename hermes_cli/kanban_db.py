@@ -7989,6 +7989,10 @@ def _default_spawn(
     # terminal/file containment boundary; ordinary interactive Hermes sessions
     # keep their configured execution behavior unchanged.
     env["HERMES_KANBAN_CONFINEMENT"] = "1"
+    # Confinement is an execution contract, not merely a guard on a globally
+    # selected backend.  Pin the worker to Docker so a normal interactive
+    # default of TERMINAL_ENV=local cannot turn a queued task into a host run.
+    env["TERMINAL_ENV"] = "docker"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already

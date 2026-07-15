@@ -77,6 +77,7 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
     assert captured["cwd"] == canonical_workspace
     assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == canonical_workspace
     assert captured["env"]["HERMES_KANBAN_CONFINEMENT"] == "1"
+    assert captured["env"]["TERMINAL_ENV"] == "docker"
 
 
 def test_worker_spawn_rejects_nonexistent_workspace_before_popen(monkeypatch, tmp_path):
