@@ -856,6 +856,11 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    # Immutable admission facts for a pre-provisioned worktree.  Both are
+    # NULL for legacy / Hermes-managed worktree tasks, which retain the
+    # existing lazy-provisioning behaviour.
+    worktree_source_root: Optional[str] = None
+    worktree_base_revision: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -942,6 +947,14 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            worktree_source_root=(
+                row["worktree_source_root"]
+                if "worktree_source_root" in keys else None
+            ),
+            worktree_base_revision=(
+                row["worktree_base_revision"]
+                if "worktree_base_revision" in keys else None
+            ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1108,6 +1121,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
+    -- Immutable facts supplied by an external orchestrator for a worktree it
+    -- has provisioned already. Both NULL preserves legacy lazy provisioning.
+    worktree_source_root TEXT,
+    worktree_base_revision TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -1862,6 +1879,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "worktree_source_root" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worktree_source_root", "worktree_source_root TEXT"
+        )
+    if "worktree_base_revision" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worktree_base_revision", "worktree_base_revision TEXT"
+        )
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -2394,6 +2419,8 @@ def create_task(
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
+    worktree_source_root: Optional[str] = None,
+    worktree_base_revision: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
@@ -2448,6 +2475,29 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    # An attestation makes the worktree identity an explicit contract with an
+    # external coordinator (AgentRail).  It is deliberately opt-in so existing
+    # Hermes-created worktree tasks continue to be provisioned lazily.
+    attestation_values = (worktree_source_root, worktree_base_revision)
+    if any(value is not None for value in attestation_values):
+        if not all(value is not None and str(value).strip() for value in attestation_values):
+            raise ValueError(
+                "worktree_source_root and worktree_base_revision must be supplied together"
+            )
+        if workspace_kind != "worktree" or not workspace_path or not branch_name:
+            raise ValueError(
+                "declared worktree attestation requires workspace_kind=worktree, "
+                "workspace_path, and branch_name"
+            )
+        worktree_source_root = str(worktree_source_root).strip()
+        worktree_base_revision = str(worktree_base_revision).strip().lower()
+        if not Path(worktree_source_root).is_absolute() or not Path(workspace_path).is_absolute():
+            raise ValueError("declared worktree paths must be absolute")
+        if not re.fullmatch(r"[0-9a-f]{40}", worktree_base_revision):
+            raise ValueError("worktree_base_revision must be a full 40-character commit SHA")
+    else:
+        worktree_source_root = None
+        worktree_base_revision = None
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2634,10 +2684,11 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, worktree_source_root, worktree_base_revision,
+                        project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2651,6 +2702,8 @@ def create_task(
                         workspace_kind,
                         workspace_path,
                         branch_name,
+                        worktree_source_root,
+                        worktree_base_revision,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -2677,6 +2730,8 @@ def create_task(
                         "parents": list(parents),
                         "tenant": tenant,
                         "branch_name": branch_name,
+                        "worktree_source_root": worktree_source_root,
+                        "worktree_base_revision": worktree_base_revision,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                     },
@@ -3279,6 +3334,132 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_declared_worktree_attestation(task: Task) -> bool:
+    """Whether ``task`` is governed by an externally provisioned worktree."""
+    return bool(task.worktree_source_root or task.worktree_base_revision)
+
+
+def _task_has_run(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)
+    ).fetchone() is not None
+
+
+def _worktree_git(path: Path, *args: str) -> Optional[str]:
+    """Run a non-interactive, environment-sanitised git read command.
+
+    This preflight must never inherit ``GIT_DIR``/``GIT_WORK_TREE`` from a
+    caller, as that could make validation inspect a repository other than the
+    declared path.  The command is read-only and has a bounded runtime.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": os.environ.get("PATH", ""), "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _declared_worktree_preflight_error(
+    task: Task, *, allow_task_commits: bool
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate an attested worktree without creating or mutating anything.
+
+    ``allow_task_commits`` is used for a review/retry claim: commits made by a
+    prior worker are valid as long as the declared base remains an ancestor.
+    Initial admission requires the exact declared base.
+    """
+    if not _has_declared_worktree_attestation(task):
+        return None, task.workspace_path
+    if not task.worktree_source_root or not task.worktree_base_revision:
+        return "declared worktree attestation is incomplete", task.workspace_path
+    if task.workspace_kind != "worktree" or not task.workspace_path or not task.branch_name:
+        return "declared worktree attestation is invalid", task.workspace_path
+
+    source = Path(task.worktree_source_root)
+    target = Path(task.workspace_path)
+    if not source.is_absolute() or not target.is_absolute():
+        return "declared worktree paths must be absolute", task.workspace_path
+    if not target.is_dir():
+        return "declared worktree is missing", str(target)
+    if not source.is_dir():
+        return "declared worktree source is missing", str(target)
+    try:
+        source = source.resolve(strict=True)
+        target = target.resolve(strict=True)
+    except OSError:
+        return "declared worktree is missing", str(target)
+
+    source_top = _worktree_git(source, "rev-parse", "--show-toplevel")
+    target_top = _worktree_git(target, "rev-parse", "--show-toplevel")
+    if source_top is None or target_top is None:
+        return "declared worktree is not a git worktree", str(target)
+    if Path(source_top).resolve() != source:
+        return "declared worktree source is not a repository root", str(target)
+    source_common = _worktree_git(
+        source, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    target_common = _worktree_git(
+        target, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    if (
+        source_common is None
+        or target_common is None
+        or Path(source_common).resolve() != Path(target_common).resolve()
+    ):
+        return "declared worktree is not owned by declared source", str(target)
+
+    branch = _worktree_git(target, "branch", "--show-current")
+    if branch != task.branch_name:
+        return "declared worktree branch does not match", str(target)
+    status = _worktree_git(target, "status", "--porcelain=v1", "--untracked-files=all")
+    if status is None:
+        return "declared worktree is not a git worktree", str(target)
+    if status:
+        return "declared worktree is dirty", str(target)
+
+    base = str(task.worktree_base_revision).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", base):
+        return "declared worktree base revision is invalid", str(target)
+    if allow_task_commits:
+        if _worktree_git(target, "merge-base", "--is-ancestor", base, "HEAD^{commit}") is None:
+            return "declared worktree base revision does not match", str(target)
+    else:
+        head = _worktree_git(target, "rev-parse", "HEAD^{commit}")
+        if head is None or head.lower() != base:
+            return "declared worktree base revision does not match", str(target)
+    return None, str(target)
+
+
+def preflight_declared_worktree(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allow_task_commits: bool = False,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    """Return whether a declared worktree is safe to admit for ``task_id``.
+
+    The function is deliberately validation-only: it never creates a Git
+    worktree, changes a task state, or creates a run.  The canonical target
+    path is returned on success for the dispatcher to use directly.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, f"task {task_id} not found", None
+    error, workspace = _declared_worktree_preflight_error(
+        task, allow_task_commits=allow_task_commits
+    )
+    return error is None, error, workspace
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3321,6 +3502,16 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            task = get_task(conn, task_id)
+            if task is None:
+                continue
+            preflight_error, _workspace = _declared_worktree_preflight_error(
+                task, allow_task_commits=_task_has_run(conn, task_id)
+            )
+            if preflight_error is not None:
+                # A declared worktree is a fail-closed admission contract:
+                # dependencies becoming complete must not silently bypass it.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -3385,6 +3576,16 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    preflight_error, _workspace = _declared_worktree_preflight_error(
+        task, allow_task_commits=_task_has_run(conn, task_id)
+    )
+    if preflight_error is not None:
+        with write_txn(conn):
+            _append_event(conn, task_id, "claim_rejected", {"reason": preflight_error})
+        return None
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -3514,6 +3715,16 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    preflight_error, _workspace = _declared_worktree_preflight_error(
+        task, allow_task_commits=True
+    )
+    if preflight_error is not None:
+        with write_txn(conn):
+            _append_event(conn, task_id, "claim_rejected", {"reason": preflight_error})
+        return None
     with write_txn(conn):
         cur = conn.execute(
             """
@@ -4997,18 +5208,22 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
+    task = get_task(conn, task_id)
+    if task is None:
         return False, f"task {task_id} not found"
 
-    cur_status = row["status"]
+    cur_status = task.status
     if cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+
+    preflight_error, _workspace = _declared_worktree_preflight_error(
+        task, allow_task_commits=_task_has_run(conn, task_id)
+    )
+    if preflight_error is not None:
+        return False, preflight_error
 
     if not force:
         parents = conn.execute(
@@ -5058,6 +5273,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    preflight_error, _workspace = _declared_worktree_preflight_error(
+        task, allow_task_commits=_task_has_run(conn, task_id)
+    )
+    if preflight_error is not None:
+        return False
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -5783,6 +6006,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
+        if _has_declared_worktree_attestation(task):
+            error, workspace = _declared_worktree_preflight_error(
+                task, allow_task_commits=True
+            )
+            if error is not None or workspace is None:
+                raise ValueError(error or "declared worktree is unavailable")
+            return Path(workspace)
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
@@ -5791,6 +6021,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    task = get_task(conn, task_id)
+    if task is not None and _has_declared_worktree_attestation(task):
+        if str(path) != (task.workspace_path or ""):
+            raise ValueError("declared worktree identity is immutable")
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
@@ -5801,6 +6035,10 @@ def set_workspace_path(
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
+    task = get_task(conn, task_id)
+    if task is not None and _has_declared_worktree_attestation(task):
+        if str(branch_name) != (task.branch_name or ""):
+            raise ValueError("declared worktree identity is immutable")
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
@@ -5918,6 +6156,8 @@ class DispatchResult:
     promoted: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    skipped_worktree_preflight: list[tuple[str, str]] = field(default_factory=list)
+    """Declared worktrees rejected before claim/spawn, as ``(task_id, reason)``."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -7616,6 +7856,21 @@ def _dispatch_once_locked(
                     (row["id"], row_assignee, current)
                 )
                 continue
+        task = get_task(conn, row["id"])
+        if task is None:
+            continue
+        preflight_error, declared_workspace = _declared_worktree_preflight_error(
+            task, allow_task_commits=_task_has_run(conn, task.id)
+        )
+        if preflight_error is not None:
+            result.skipped_worktree_preflight.append((task.id, preflight_error))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task.id, "worktree_preflight_rejected",
+                        {"reason": preflight_error},
+                    )
+            continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
@@ -7638,7 +7893,7 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
+            result.spawned.append((row["id"], row_assignee, declared_workspace or ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -7653,7 +7908,15 @@ def _dispatch_once_locked(
             continue
         try:
             resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
+            if _has_declared_worktree_attestation(claimed):
+                preflight_error, declared_workspace = _declared_worktree_preflight_error(
+                    claimed, allow_task_commits=True
+                )
+                if preflight_error is not None or declared_workspace is None:
+                    raise ValueError(preflight_error or "declared worktree is unavailable")
+                workspace = Path(declared_workspace)
+                resolved_branch_name = claimed.branch_name
+            elif claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
@@ -7666,8 +7929,9 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
+        if not _has_declared_worktree_attestation(claimed):
+            set_workspace_path(conn, claimed.id, str(workspace))
+        if claimed.workspace_kind == "worktree" and not _has_declared_worktree_attestation(claimed):
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
@@ -7737,15 +8001,38 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        task = get_task(conn, row["id"])
+        if task is None:
+            continue
+        preflight_error, declared_workspace = _declared_worktree_preflight_error(
+            task, allow_task_commits=True
+        )
+        if preflight_error is not None:
+            result.skipped_worktree_preflight.append((task.id, preflight_error))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task.id, "worktree_preflight_rejected",
+                        {"reason": preflight_error},
+                    )
+            continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], row["assignee"], declared_workspace or ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
         try:
             resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
+            if _has_declared_worktree_attestation(claimed):
+                preflight_error, declared_workspace = _declared_worktree_preflight_error(
+                    claimed, allow_task_commits=True
+                )
+                if preflight_error is not None or declared_workspace is None:
+                    raise ValueError(preflight_error or "declared worktree is unavailable")
+                workspace = Path(declared_workspace)
+                resolved_branch_name = claimed.branch_name
+            elif claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
@@ -7758,8 +8045,9 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
+        if not _has_declared_worktree_attestation(claimed):
+            set_workspace_path(conn, claimed.id, str(workspace))
+        if claimed.workspace_kind == "worktree" and not _has_declared_worktree_attestation(claimed):
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries

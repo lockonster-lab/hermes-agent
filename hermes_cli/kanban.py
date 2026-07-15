@@ -69,6 +69,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "worktree_source_root": t.worktree_source_root,
+        "worktree_base_revision": t.worktree_base_revision,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -315,6 +317,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument(
+        "--worktree-source-root", default=None,
+        help="Absolute primary repository root for an externally provisioned worktree",
+    )
+    p_create.add_argument(
+        "--worktree-base-revision", default=None,
+        help="Full 40-character commit SHA required before first admission",
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -512,6 +522,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("task_id")
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
+
+    p_worktree_preflight = sub.add_parser(
+        "worktree-preflight",
+        help="Validate a declared worktree without creating or changing anything",
+    )
+    p_worktree_preflight.add_argument("task_id")
+    p_worktree_preflight.add_argument(
+        "--allow-task-commits", action="store_true",
+        help="Accept a clean descendant of the declared base (review/retry use)",
+    )
+    p_worktree_preflight.add_argument("--json", action="store_true")
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
@@ -950,6 +971,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
+            "worktree-preflight": _cmd_worktree_preflight,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
@@ -1335,6 +1357,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            worktree_source_root=getattr(args, "worktree_source_root", None),
+            worktree_base_revision=getattr(args, "worktree_base_revision", None),
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
@@ -1822,6 +1846,12 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             if existing is None:
                 print(f"no such task: {args.task_id}", file=sys.stderr)
                 return 1
+            _ok, preflight_error, _workspace = kb.preflight_declared_worktree(
+                conn, args.task_id, allow_task_commits=True
+            )
+            if preflight_error:
+                print(f"cannot claim {args.task_id}: {preflight_error}", file=sys.stderr)
+                return 1
             print(
                 f"cannot claim {args.task_id}: status={existing.status} "
                 f"lock={existing.claim_lock or '(none)'}",
@@ -1829,10 +1859,33 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             )
             return 1
         workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        if not (task.worktree_source_root or task.worktree_base_revision):
+            kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0
+
+
+def _cmd_worktree_preflight(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok, reason, workspace = kb.preflight_declared_worktree(
+            conn,
+            args.task_id,
+            allow_task_commits=bool(args.allow_task_commits),
+        )
+    payload = {
+        "task_id": args.task_id,
+        "ok": ok,
+        "reason": reason,
+        "workspace": workspace,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    elif ok:
+        print(f"Declared worktree is ready: {workspace}")
+    else:
+        print(f"Declared worktree is not ready: {reason}", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def _cmd_comment(args: argparse.Namespace) -> int:
@@ -2007,6 +2060,13 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            ok, preflight_error, _workspace = kb.preflight_declared_worktree(
+                conn, tid, allow_task_commits=True
+            )
+            if not ok:
+                failed.append(tid)
+                print(f"cannot unblock {tid}: {preflight_error}", file=sys.stderr)
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
@@ -2174,6 +2234,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
             ],
+            "skipped_worktree_preflight": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.skipped_worktree_preflight
+            ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_per_profile_capped": [
@@ -2201,6 +2265,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if res.skipped_worktree_preflight:
+        for tid, reason in res.skipped_worktree_preflight:
+            print(f"Skipped (worktree preflight): {tid}: {reason}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
