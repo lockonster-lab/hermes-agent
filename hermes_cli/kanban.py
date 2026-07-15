@@ -415,6 +415,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_bootstrap_prepare.add_argument("--json", action="store_true")
 
+    p_worktree_preflight = sub.add_parser(
+        "worktree-preflight", help="Validate one declared worktree without lifecycle mutation"
+    )
+    p_worktree_preflight.add_argument("task_id")
+    p_worktree_preflight.add_argument("--json", action="store_true")
+
     # --- coordinator-only ---
     p_coordinator_only = sub.add_parser(
         "coordinator-only",
@@ -1018,6 +1024,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "bootstrap-prepare": _cmd_bootstrap_prepare,
+            "worktree-preflight": _cmd_worktree_preflight,
             "coordinator-only": _cmd_coordinator_only,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -2196,6 +2203,19 @@ def _cmd_bootstrap_prepare(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0 if result.ok else 1
+
+
+def _cmd_worktree_preflight(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok, reason, workspace_path = kb.preflight_declared_worktree(conn, args.task_id)
+    payload = {"task_id": args.task_id, "ok": ok, "reason": reason, "workspace_path": workspace_path}
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    elif ok:
+        print(f"declared worktree verified: {workspace_path}")
+    else:
+        print(f"declared worktree preflight failed: {reason}", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

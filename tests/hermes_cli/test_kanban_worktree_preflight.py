@@ -3,10 +3,30 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
 import hermes_cli.kanban_db as kb
+
+
+def _git(path: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _linked_worktree(tmp_path: Path) -> tuple[Path, Path, str]:
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init")
+    _git(source, "config", "user.email", "test@example.invalid")
+    _git(source, "config", "user.name", "Test")
+    (source / "README").write_text("source\n")
+    _git(source, "add", "README")
+    _git(source, "commit", "-m", "base")
+    base = _git(source, "rev-parse", "HEAD")
+    target = tmp_path / "target"
+    _git(source, "worktree", "add", "-b", "wt/preflight", str(target), base)
+    return source, target, base
 
 
 @pytest.fixture
@@ -67,3 +87,31 @@ def test_claim_refuses_ready_task_with_missing_declared_worktree(
     assert task is not None
     assert task.status == "ready"
     assert runs == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("branch", "declared worktree branch does not match"),
+        ("head", "declared worktree base revision does not match"),
+        ("dirty", "declared worktree is dirty"),
+    ],
+)
+def test_preflight_refuses_attestation_drift(
+    kanban_home, tmp_path: Path, mutation: str, expected: str,
+) -> None:
+    source, target, base = _linked_worktree(tmp_path)
+    if mutation == "branch":
+        _git(target, "checkout", "-b", "wt/drift")
+    elif mutation == "head":
+        (target / "README").write_text("changed\n")
+        _git(target, "add", "README")
+        _git(target, "commit", "-m", "drift")
+    else:
+        (target / "dirty").write_text("x")
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="attested", workspace_kind="worktree", workspace_path=str(target), branch_name="wt/preflight", worktree_source_root=str(source), worktree_base_revision=base)
+        ok, reason, workspace = kb.preflight_declared_worktree(conn, task_id)
+    assert not ok
+    assert reason == expected
+    assert workspace == str(target)

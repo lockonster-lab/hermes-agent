@@ -3712,6 +3712,17 @@ def _declared_worktree_preflight_error(task: Task) -> Optional[str]:
     return None
 
 
+def preflight_declared_worktree(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[bool, Optional[str], Optional[str]]:
+    """Validate one declared worktree without mutating task/run state."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, f"task {task_id!r} not found", None
+    error = _declared_worktree_preflight_error(task)
+    return not bool(error), error, task.workspace_path
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
