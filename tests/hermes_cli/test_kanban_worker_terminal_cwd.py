@@ -52,6 +52,7 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(kb, "_preflight_confined_worker_docker_image", lambda _image: None)
     kb._default_spawn(_make_task(kb), workspace)
     return captured
 

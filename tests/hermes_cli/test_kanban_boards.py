@@ -398,7 +398,9 @@ class TestWorkerSpawnEnv:
             return FakeProc()
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(kb, "_preflight_confined_worker_docker_image", lambda _image: None)
         kb.create_board("spawntest")
+        (fresh_home / "ws").mkdir()
 
         task = kb.Task(
             id="t_abc",
@@ -440,6 +442,8 @@ class TestWorkerSpawnEnv:
             return FakeProc()
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(kb, "_preflight_confined_worker_docker_image", lambda _image: None)
+        (fresh_home / "ws").mkdir()
         task = kb.Task(
             id="t_def",
             title="",

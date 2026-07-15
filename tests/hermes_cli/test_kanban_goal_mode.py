@@ -132,6 +132,7 @@ def test_spawn_sets_goal_env_only_when_enabled(kanban_home, monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_preflight_confined_worker_docker_image", lambda _image: None)
 
     with kb.connect() as conn:
         tid = kb.create_task(
@@ -160,6 +161,7 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", _fake_popen)
+    monkeypatch.setattr(kb, "_preflight_confined_worker_docker_image", lambda _image: None)
 
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="plain", assignee="default")

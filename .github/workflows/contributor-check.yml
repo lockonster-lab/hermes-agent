@@ -16,8 +16,15 @@ jobs:
 
       - name: Check for unmapped contributor emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Use this PR's declared base, not the repository default branch.
+          # Stacked PRs intentionally have commits that are new relative to
+          # main but already reviewed by their declared base branch.
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::pull_request base SHA is required for contributor attribution"
+            exit 1
+          fi
+          MERGE_BASE=$(git merge-base "$BASE_SHA" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
