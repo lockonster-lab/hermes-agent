@@ -936,6 +936,8 @@ class Task:
     bootstrap_kind: Optional[str] = None
     bootstrap_source_root: Optional[str] = None
     bootstrap_base_revision: Optional[str] = None
+    worktree_source_root: Optional[str] = None
+    worktree_base_revision: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1042,6 +1044,16 @@ class Task:
             bootstrap_base_revision=(
                 row["bootstrap_base_revision"]
                 if "bootstrap_base_revision" in keys and row["bootstrap_base_revision"]
+                else None
+            ),
+            worktree_source_root=(
+                row["worktree_source_root"]
+                if "worktree_source_root" in keys and row["worktree_source_root"]
+                else None
+            ),
+            worktree_base_revision=(
+                row["worktree_base_revision"]
+                if "worktree_base_revision" in keys and row["worktree_base_revision"]
                 else None
             ),
         )
@@ -1243,7 +1255,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Immutable identity for the deliberately narrow self-repair bootstrap.
     bootstrap_kind          TEXT,
     bootstrap_source_root   TEXT,
-    bootstrap_base_revision TEXT
+    bootstrap_base_revision TEXT,
+    worktree_source_root   TEXT,
+    worktree_base_revision TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2106,6 +2120,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "bootstrap_source_root",
             "bootstrap_source_root TEXT",
         )
+    if "worktree_source_root" not in cols:
+        _add_column_if_missing(conn, "tasks", "worktree_source_root", "worktree_source_root TEXT")
+    if "worktree_base_revision" not in cols:
+        _add_column_if_missing(conn, "tasks", "worktree_base_revision", "worktree_base_revision TEXT")
     if "bootstrap_base_revision" not in cols:
         _add_column_if_missing(
             conn,
@@ -2536,6 +2554,8 @@ def create_task(
     bootstrap_kind: Optional[str] = None,
     bootstrap_source_root: Optional[str] = None,
     bootstrap_base_revision: Optional[str] = None,
+    worktree_source_root: Optional[str] = None,
+    worktree_base_revision: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -2591,6 +2611,11 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if workspace_kind == "worktree" and (worktree_source_root or worktree_base_revision):
+        if not workspace_path or not branch_name:
+            raise ValueError("worktree attestation requires an explicit path and branch_name")
+        if not worktree_source_root or not re.fullmatch(r"[0-9a-fA-F]{40}", str(worktree_base_revision)):
+            raise ValueError("worktree attestation requires source root and full 40-character base revision")
 
     bootstrap_fields = (
         bootstrap_source_root,
@@ -2826,8 +2851,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
                         requires_manual_promotion, execution_mode, bootstrap_kind,
-                        bootstrap_source_root, bootstrap_base_revision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        bootstrap_source_root, bootstrap_base_revision,
+                        worktree_source_root, worktree_base_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2855,6 +2881,8 @@ def create_task(
                         bootstrap_kind,
                         bootstrap_source_root,
                         bootstrap_base_revision,
+                        worktree_source_root,
+                        str(worktree_base_revision).lower() if worktree_base_revision else None,
                     ),
                 )
                 for pid in parents:
@@ -3648,9 +3676,8 @@ def recompute_ready(
 def _declared_worktree_preflight_error(task: Task) -> Optional[str]:
     """Return a fail-closed release error for an explicit worktree target.
 
-    This first #31 gate deliberately verifies only target existence.  Branch,
-    source and base attestation are added by the subsequent contract slice;
-    a missing target must never reach a ready or claimed worker lifecycle.
+    This check never materializes a worktree.  An incomplete attestation is a
+    release denial, not a request to fall back to ``HEAD`` or a board default.
     """
     if task.workspace_kind != "worktree":
         return None
@@ -3659,6 +3686,29 @@ def _declared_worktree_preflight_error(task: Task) -> Optional[str]:
     target = Path(task.workspace_path)
     if not target.is_absolute() or not target.is_dir():
         return "declared worktree is missing"
+    if not task.worktree_source_root or not task.worktree_base_revision:
+        return "declared worktree lacks immutable source/base attestation"
+    source = Path(task.worktree_source_root)
+    if not source.is_absolute() or not source.is_dir() or not task.branch_name:
+        return "declared worktree attestation is invalid"
+    def git(path: Path, *args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30, check=False)
+        except OSError:
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+    if git(source, "rev-parse", "--show-toplevel") != str(source.resolve()):
+        return "declared worktree source is not its Git top-level"
+    if git(target, "rev-parse", "--show-toplevel") != str(target.resolve()):
+        return "declared worktree is not its Git top-level"
+    if git(source, "rev-parse", "--path-format=absolute", "--git-common-dir") != git(target, "rev-parse", "--path-format=absolute", "--git-common-dir"):
+        return "declared worktree is not owned by declared source"
+    if git(target, "branch", "--show-current") != task.branch_name:
+        return "declared worktree branch does not match"
+    if git(target, "rev-parse", "HEAD^{commit}") != task.worktree_base_revision:
+        return "declared worktree base revision does not match"
+    if git(target, "status", "--porcelain=v1", "--untracked-files=all"):
+        return "declared worktree is dirty"
     return None
 
 

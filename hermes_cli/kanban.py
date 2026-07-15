@@ -85,6 +85,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "bootstrap_kind": t.bootstrap_kind,
         "bootstrap_source_root": t.bootstrap_source_root,
         "bootstrap_base_revision": t.bootstrap_base_revision,
+        "worktree_source_root": t.worktree_source_root,
+        "worktree_base_revision": t.worktree_base_revision,
     }
 
 
@@ -320,6 +322,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--worktree-source-root", default=None,
+                          help="Immutable Git source root for a declared worktree")
+    p_create.add_argument("--worktree-base-revision", default=None,
+                          help="Immutable full base SHA for a declared worktree")
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1407,6 +1413,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             bootstrap_kind=getattr(args, "bootstrap_kind", None),
             bootstrap_source_root=getattr(args, "bootstrap_source_root", None),
             bootstrap_base_revision=getattr(args, "bootstrap_base_revision", None),
+            worktree_source_root=getattr(args, "worktree_source_root", None),
+            worktree_base_revision=getattr(args, "worktree_base_revision", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
