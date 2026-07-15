@@ -107,6 +107,24 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     assert task.branch_name == "wt/t6-wire"
 
 
+def test_run_slash_create_persists_declared_worktree_attestation(kanban_home, tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    base = "a" * 40
+    out = kc.run_slash(
+        "create guarded --workspace worktree:{} --branch agent/guarded "
+        "--worktree-source-root {} --worktree-base-revision {}".format(
+            target, source, base
+        )
+    )
+
+    assert "Created" in out
+    with kb.connect_closing() as conn:
+        task = kb.list_tasks(conn)[0]
+    assert task.worktree_source_root == str(source)
+    assert task.worktree_base_revision == base
+
+
 def test_run_slash_rejects_branch_without_worktree(kanban_home):
     out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad")
     assert "--branch is only valid with --workspace worktree" in out
