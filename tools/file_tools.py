@@ -396,9 +396,22 @@ def _resolve_base_dir(
     outright (rather than anchoring them to the process cwd) and fall through to
     the process cwd only as a last resort, deterministically.
     """
-    root = _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
+    if container_paths:
+        # A dispatcher-confined worker has exactly one host mount.  File-tool
+        # paths must use its in-container name instead of the host worktree
+        # recorded in TERMINAL_CWD, otherwise an initial file operation can
+        # disagree with the terminal boundary before any environment exists.
+        from tools.terminal_tool import _confined_kanban_workspace
+
+        _workspace, confinement_error = _confined_kanban_workspace()
+        if confinement_error:
+            raise ValueError(confinement_error)
+        if _workspace is not None:
+            return PurePosixPath("/workspace")
+
+    root = _authoritative_workspace_root(task_id)
     if root:
         base_text = _expand_tilde(root)
     else:
@@ -427,6 +440,56 @@ def _resolve_base_dir(
     return base.resolve()
 
 
+def _assert_confined_kanban_path(path: Path | PurePosixPath) -> Path | PurePosixPath:
+    """Return *path* only when a marked worker keeps it inside its workspace.
+
+    The dispatcher-owned marker is checked through the terminal module's
+    canonical resolver so file and terminal tools cannot disagree about the
+    workspace boundary.  Rejecting reads as well as writes is intentional:
+    granting an out-of-worktree read here could be chained into a later write
+    or disclose data outside the task contract.
+    """
+    from tools.terminal_tool import _confined_kanban_workspace
+
+    workspace, error = _confined_kanban_workspace()
+    if error:
+        raise ValueError(error)
+    if workspace is None:
+        return path
+
+    root: Path | PurePosixPath
+    if isinstance(path, Path):
+        # ``Path`` is also a ``PurePosixPath`` on POSIX, so test it first.
+        # Resolve here (not only in callers) to make every platform-specific
+        # branch reject a symlink that leaves the declared host workspace.
+        try:
+            path = path.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("Could not canonicalize the Kanban file path.") from exc
+        root = workspace
+    else:
+        # A confined Docker worker mounts its only host directory at this
+        # fixed in-container path.  Preserve the container spelling for the
+        # backend, but resolve its matching host target solely to reject a
+        # workspace symlink that would escape at command execution time.
+        root = PurePosixPath("/workspace")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Resolved path {str(path)!r} is outside the declared Kanban workspace {str(root)!r}."
+        ) from exc
+    if isinstance(path, PurePosixPath) and not isinstance(path, Path):
+        try:
+            host_target = workspace.joinpath(*relative.parts).resolve(strict=False)
+            host_target.relative_to(workspace)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"Resolved path {str(path)!r} is outside the declared Kanban workspace {str(root)!r}."
+            ) from exc
+    return path
+
+
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory.
 
@@ -441,9 +504,9 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     if container_paths:
         expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
-            return _normalize_without_host_deref(expanded)
+            return _assert_confined_kanban_path(_normalize_without_host_deref(expanded))
         resolved = _resolve_base_dir(task_id, container_paths=True) / expanded
-        return _normalize_without_host_deref(resolved)
+        return _assert_confined_kanban_path(_normalize_without_host_deref(resolved))
 
     # Host paths only — never rewrite Linux paths inside a container/WSL env.
     from tools.environments.local import _msys_to_windows_path
@@ -453,15 +516,15 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
         import ntpath
 
         if ntpath.isabs(expanded):
-            return Path(ntpath.normpath(expanded))
+            return _assert_confined_kanban_path(Path(ntpath.normpath(expanded)))
         joined = ntpath.join(str(_resolve_base_dir(task_id, container_paths=False)), expanded)
-        return Path(ntpath.normpath(joined))
+        return _assert_confined_kanban_path(Path(ntpath.normpath(joined)))
 
     p = Path(expanded)
     if p.is_absolute():
-        return p.resolve()
+        return _assert_confined_kanban_path(p.resolve())
     resolved = _resolve_base_dir(task_id, container_paths=False) / p
-    return resolved.resolve()
+    return _assert_confined_kanban_path(resolved.resolve())
 
 
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
@@ -1053,11 +1116,26 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _resolve_container_task_id,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
+        _confined_kanban_workspace,
     )
     import time
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
+    config = _get_env_config()
+    confined_workspace, confinement_error = _confined_kanban_workspace()
+    if confinement_error:
+        raise ValueError(confinement_error)
+    if confined_workspace is not None:
+        if config["env_type"] != "docker":
+            raise ValueError(
+                "Kanban worker confinement requires an isolated Docker file backend; "
+                "host-local file operations are blocked."
+            )
+        # Match terminal_tool's isolated key.  Never reuse an ordinary session
+        # cache that may already point to an unconfined backend.
+        task_id = f"kanban-{os.environ['HERMES_KANBAN_TASK']}"
+    else:
+        task_id = _resolve_container_task_id(raw_task_id)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
@@ -1098,7 +1176,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         if terminal_env is None:
             from tools.terminal_tool import resolve_task_overrides
 
-            config = _get_env_config()
             env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
 
@@ -1114,6 +1191,10 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 image = ""
 
             cwd = overrides.get("cwd") or _last_known_cwd.get(task_id) or config["cwd"]
+            if confined_workspace is not None:
+                # The path is meaningful only inside the dedicated Docker
+                # mount.  Ignore all ordinary session cwd overrides.
+                cwd = "/workspace"
             # Re-apply the container cwd guard that _get_env_config() already
             # ran on config["cwd"] (see #50636).  A per-task cwd override
             # registered by the gateway/TUI/ACP for workspace tracking is a
@@ -1149,6 +1230,23 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
                 }
+                if confined_workspace is not None:
+                    # Keep file tools on the exact same capability boundary as
+                    # terminal_tool.  An earlier direct file call must not be
+                    # able to create a local/shared environment, forward host
+                    # credentials, or inherit arbitrary host mounts.
+                    container_config.update({
+                        "container_persistent": False,
+                        "docker_volumes": [],
+                        "docker_mount_cwd_to_workspace": True,
+                        "docker_mount_host_auxiliary": False,
+                        "docker_forward_env": [],
+                        "docker_env": {},
+                        "docker_run_as_host_user": False,
+                        "docker_network": False,
+                        "docker_persistent": False,
+                        "docker_extra_args": [],
+                    })
 
             ssh_config = None
             if env_type == "ssh":
@@ -1175,7 +1273,11 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 container_config=container_config,
                 local_config=local_config,
                 task_id=task_id,
-                host_cwd=config.get("host_cwd"),
+                host_cwd=(
+                    str(confined_workspace)
+                    if confined_workspace is not None
+                    else config.get("host_cwd")
+                ),
             )
 
             with _env_lock:

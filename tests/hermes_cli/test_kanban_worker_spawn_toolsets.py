@@ -24,14 +24,13 @@ def _make_task(kb, *, assignee: str):
     )
 
 
-def test_default_spawn_pins_assignee_profile_cli_toolsets(monkeypatch, tmp_path):
-    """Manual profile assignment should keep that profile's CLI tools.
+def test_default_spawn_removes_unconfined_execution_toolsets(monkeypatch, tmp_path):
+    """A confined worker keeps task tools but loses alternate host execution.
 
-    Regression guard for dispatcher-spawned workers that boot with
-    HERMES_KANBAN_TASK: the worker must not collapse to only kanban lifecycle
-    tools when the assigned profile's top-level ``toolsets`` is the default
-    composite. The spawned CLI gets an explicit --toolsets pin resolved from
-    platform_toolsets.cli; model_tools appends task-scoped kanban tools later.
+    ``code_execution`` can create a local Python subprocess outside the
+    terminal backend, while ``delegation`` can create an untracked child.  Both
+    bypass the worker's declared-workspace boundary and must be removed from
+    the explicit CLI toolset pin.  Normal coding/research tools stay present.
     """
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"
@@ -85,8 +84,11 @@ agent:
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
-    for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
+    for required in ("terminal", "file", "skills"):
         assert required in pinned
+    assert "web" not in pinned
+    assert "code_execution" not in pinned
+    assert "delegation" not in pinned
 
 
 def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
@@ -123,6 +125,39 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
 
     assert "--cli" in captured["cmd"]
     assert "HERMES_TUI" not in captured["env"]
+
+
+def test_default_spawn_uses_safe_toolset_pin_when_profile_resolution_fails(monkeypatch, tmp_path):
+    """A failed profile lookup must not silently restore the CLI default composite."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda home: None)
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert "terminal" in pinned
+    assert "file" in pinned
+    assert "code_execution" not in pinned
+    assert "delegation" not in pinned
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):

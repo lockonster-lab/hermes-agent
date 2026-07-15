@@ -48,6 +48,7 @@ def _make_dummy_env(**kwargs):
         network=kwargs.get("network", True),
         host_cwd=kwargs.get("host_cwd"),
         auto_mount_cwd=kwargs.get("auto_mount_cwd", False),
+        mount_host_auxiliary=kwargs.get("mount_host_auxiliary", True),
         env=kwargs.get("env"),
         run_as_host_user=kwargs.get("run_as_host_user", False),
         persist_across_processes=kwargs.get("persist_across_processes", True),
@@ -206,6 +207,48 @@ def test_auto_mount_replaces_persistent_workspace_bind(monkeypatch, tmp_path):
     run_args_str = " ".join(run_calls[0][0])
     assert f"{project_dir}:/workspace" in run_args_str
     assert "/sandboxes/docker/test-persistent-auto-mount/workspace:/workspace" not in run_args_str
+
+
+def test_isolated_worker_mount_skips_credentials_skills_and_caches(monkeypatch, tmp_path):
+    """A worker may receive its worktree, but no other host data mounts."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    credential = tmp_path / "token.json"
+    credential.write_text('{"token": "not-for-worker"}')
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [{"host_path": str(credential), "container_path": "/root/.hermes/token.json"}],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [{"host_path": str(skills_dir), "container_path": "/opt/skills"}],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_cache_directory_mounts",
+        lambda: [{"host_path": str(cache_dir), "container_path": "/opt/cache"}],
+    )
+
+    _make_dummy_env(
+        cwd="/workspace",
+        host_cwd=str(project_dir),
+        auto_mount_cwd=True,
+        mount_host_auxiliary=False,
+    )
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert f"{project_dir}:/workspace" in run_args_str
+    assert str(credential) not in run_args_str
+    assert str(skills_dir) not in run_args_str
+    assert str(cache_dir) not in run_args_str
 
 
 def test_non_persistent_cleanup_removes_container(monkeypatch):

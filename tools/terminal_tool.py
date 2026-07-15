@@ -1438,6 +1438,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             volumes=volumes,
             host_cwd=host_cwd,
             auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
+            mount_host_auxiliary=cc.get("docker_mount_host_auxiliary", True),
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
@@ -2007,6 +2008,57 @@ def _resolve_command_cwd(
     return default_cwd
 
 
+def _confined_kanban_workspace() -> tuple[Path | None, str | None]:
+    """Return the dispatcher-owned worker workspace or a fail-closed error.
+
+    ``cwd`` is normally a convenience default, not a security boundary.  A
+    Kanban worker spawned with the confinement marker is different: it may use
+    a terminal only when the dispatcher supplied one existing canonical
+    workspace.  The marker is injected by ``kanban_db._default_spawn`` and is
+    intentionally not a user-facing configuration knob.
+    """
+    if os.environ.get("HERMES_KANBAN_CONFINEMENT") != "1":
+        return None, None
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    raw_workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if not task_id or not raw_workspace:
+        return None, "Kanban worker confinement is missing its task or workspace identity."
+
+    workspace = Path(raw_workspace).expanduser()
+    if not workspace.is_absolute() or not workspace.is_dir():
+        return None, "Kanban worker confinement requires an existing absolute workspace."
+    try:
+        resolved = workspace.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, "Kanban worker confinement could not canonicalize its workspace."
+    if not resolved.is_dir():
+        return None, "Kanban worker confinement requires a directory workspace."
+    return resolved, None
+
+
+_KANBAN_TOOLCHAIN_RECOVERY_RE = re.compile(
+    r"""(?ix)
+    (?:^|[\s;|&()])(?:\S*/)?(?:brew|port|apt(?:-get)?|dnf|yum|pacman|apk|
+        pip(?:3)?|pipx|poetry|uv|conda|mamba)\b
+    |
+    \b(?:python(?:\d+(?:\.\d+)*)?|pypy(?:\d+)?)\s+-m\s+(?:venv|pip)\b
+    |
+    \bvirtualenv\b
+    """
+)
+
+
+def _is_kanban_toolchain_recovery(command: str) -> bool:
+    """Return whether a worker command attempts local toolchain repair.
+
+    Container isolation prevents a bypass from mutating the host; this explicit
+    gate also preserves the task contract by rejecting known package-manager,
+    pip, and virtual-environment entry points before any container is created.
+    """
+    return bool(_KANBAN_TOOLCHAIN_RECOVERY_RE.search(command))
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2066,12 +2118,46 @@ def terminal_tool(
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+        confined_workspace, confinement_error = _confined_kanban_workspace()
+        if confinement_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": confinement_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
+        if confined_workspace is not None and env_type != "docker":
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Kanban worker confinement requires an isolated Docker terminal; "
+                    "host-local execution is blocked. Record a bounded blocker instead "
+                    "of repairing tooling or falling back to the host."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
+        if confined_workspace is not None and _is_kanban_toolchain_recovery(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Kanban worker toolchain recovery is blocked. Record a bounded "
+                    "test-environment blocker; do not create or repair interpreters, "
+                    "virtual environments, or packages."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+        if confined_workspace is not None:
+            # Do not reuse a session's shared/default container.  One worker
+            # gets one short-lived execution environment bound to one mount.
+            effective_task_id = f"kanban-{os.environ['HERMES_KANBAN_TASK']}"
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -2094,6 +2180,10 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
+        if confined_workspace is not None:
+            # Docker receives the host workspace solely at /workspace.  The
+            # in-container cwd must never be a host path or a caller override.
+            cwd = "/workspace"
         # A per-task cwd override (registered by the gateway/TUI for workspace
         # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
         # config["cwd"] was already sanitized for container backends in
@@ -2215,6 +2305,25 @@ def terminal_tool(
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
                             }
+                            if confined_workspace is not None:
+                                # Ignore caller-configured host mounts, network,
+                                # persistence, and raw Docker arguments.  The
+                                # only host capability this worker receives is
+                                # its declared canonical workspace.
+                                container_config.update({
+                                    "container_persistent": False,
+                                    "docker_volumes": [],
+                                    "docker_mount_cwd_to_workspace": True,
+                                    "docker_mount_host_auxiliary": False,
+                                    "docker_forward_env": [],
+                                    "docker_env": {},
+                                    "docker_run_as_host_user": False,
+                                    "docker_network": False,
+                                    "docker_persistent": False,
+                                    "docker_persist_across_processes": False,
+                                    "docker_orphan_reaper": False,
+                                    "docker_extra_args": [],
+                                })
 
                         local_config = None
                         if env_type == "local":
@@ -2231,7 +2340,11 @@ def terminal_tool(
                             container_config=container_config,
                             local_config=local_config,
                             task_id=effective_task_id,
-                            host_cwd=config.get("host_cwd"),
+                            host_cwd=(
+                                str(confined_workspace)
+                                if confined_workspace is not None
+                                else config.get("host_cwd")
+                            ),
                         )
                     except ImportError as e:
                         return json.dumps({

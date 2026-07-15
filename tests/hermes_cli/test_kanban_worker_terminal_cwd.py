@@ -71,31 +71,47 @@ def test_terminal_cwd_pinned_to_workspace(monkeypatch, tmp_path):
 
     captured = _capture_spawn_env(kb, monkeypatch, str(workspace))
 
-    assert captured["env"]["TERMINAL_CWD"] == str(workspace)
+    canonical_workspace = str(workspace.resolve())
+    assert captured["env"]["TERMINAL_CWD"] == canonical_workspace
     # The subprocess cwd and TERMINAL_CWD must agree — both anchor the workspace.
-    assert captured["cwd"] == str(workspace)
-    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert captured["cwd"] == canonical_workspace
+    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == canonical_workspace
+    assert captured["env"]["HERMES_KANBAN_CONFINEMENT"] == "1"
 
 
-def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path):
-    """A non-directory workspace must NOT clobber the inherited TERMINAL_CWD.
-
-    file_tools rejects relative / sentinel TERMINAL_CWD values, so writing a
-    meaningless (nonexistent) path would be worse than leaving the inherited
-    one. The guard requires an existing absolute dir.
-    """
+def test_worker_spawn_rejects_nonexistent_workspace_before_popen(monkeypatch, tmp_path):
+    """A worker must fail closed instead of inheriting a host working directory."""
     root = tmp_path / ".hermes"
     (root / "profiles" / "w").mkdir(parents=True)
     (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
     root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setenv("TERMINAL_CWD", "/pre/existing/anchor")
-
     from hermes_cli import kanban_db as kb
 
     missing = tmp_path / "does-not-exist"
 
-    captured = _capture_spawn_env(kb, monkeypatch, str(missing))
+    import pytest
 
-    # Inherited value is preserved (not overwritten with a bogus path).
-    assert captured["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
+    with pytest.raises(ValueError, match="workspace"):
+        _capture_spawn_env(kb, monkeypatch, str(missing))
+
+
+def test_worker_spawn_canonicalizes_a_workspace_symlink(monkeypatch, tmp_path):
+    """The child sees the real worktree root, never an attacker-controlled alias."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "w").mkdir(parents=True)
+    (root / "profiles" / "w" / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace, target_is_directory=True)
+
+    captured = _capture_spawn_env(kb, monkeypatch, str(alias))
+
+    assert captured["cwd"] == str(workspace.resolve())
+    assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace.resolve())

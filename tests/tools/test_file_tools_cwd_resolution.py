@@ -100,6 +100,60 @@ def test_absolute_input_path_ignores_base(_isolated_cwd, monkeypatch):
     assert resolved == Path(abs_target).resolve()
 
 
+def test_confined_worker_rejects_absolute_path_outside_declared_workspace(tmp_path, monkeypatch):
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_confined")
+    monkeypatch.setenv("HERMES_KANBAN_CONFINEMENT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+    with pytest.raises(ValueError, match="outside the declared Kanban workspace"):
+        ft._resolve_path_for_task(str(outside), task_id="worker")
+
+
+def test_confined_worker_rejects_symlink_escape_from_declared_workspace(tmp_path, monkeypatch):
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "venv-link").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_confined")
+    monkeypatch.setenv("HERMES_KANBAN_CONFINEMENT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+    with pytest.raises(ValueError, match="outside the declared Kanban workspace"):
+        ft._resolve_path_for_task("venv-link/python", task_id="worker")
+
+
+def test_confinement_helper_canonicalizes_before_checking_symlink_containment(tmp_path, monkeypatch):
+    """Every caller, including a platform-specific path branch, gets the same guard."""
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "venv-link").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_confined")
+    monkeypatch.setenv("HERMES_KANBAN_CONFINEMENT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+    with pytest.raises(ValueError, match="outside the declared Kanban workspace"):
+        ft._assert_confined_kanban_path(workspace / "venv-link" / "python")
+
+
+def test_confined_worker_allows_a_host_path_inside_declared_workspace(tmp_path, monkeypatch):
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_confined")
+    monkeypatch.setenv("HERMES_KANBAN_CONFINEMENT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+
+    resolved = ft._resolve_path_for_task("src/module.py", task_id="worker")
+
+    assert resolved == workspace / "src" / "module.py"
+
+
 def test_container_absolute_input_path_does_not_follow_host_symlink(tmp_path, monkeypatch):
     """Docker paths are sandbox-local and must not be host-dereferenced.
 

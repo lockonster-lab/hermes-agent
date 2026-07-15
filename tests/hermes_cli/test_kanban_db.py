@@ -3135,7 +3135,9 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
-        kb._default_spawn(task, str(tmp_path / "ws"))
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        kb._default_spawn(task, str(workspace))
 
         env = captured["env"]
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")

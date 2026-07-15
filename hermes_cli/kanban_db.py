@@ -7916,6 +7916,10 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_CONFINED_WORKER_ALLOWED_TOOLSETS = frozenset({"file", "skills", "terminal"})
+_CONFINED_WORKER_FALLBACK_TOOLSETS = ("file", "skills", "terminal")
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -7937,6 +7941,20 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # A worker must never inherit the dispatcher's cwd when its declared
+    # workspace is missing or ambiguous.  Canonicalize before constructing the
+    # child environment so every downstream boundary (Popen, terminal, and
+    # file tools) receives one concrete directory rather than a symlink alias.
+    workspace_path = Path(workspace).expanduser()
+    if not workspace_path.is_absolute() or not workspace_path.is_dir():
+        raise ValueError(
+            f"kanban worker workspace must be an existing absolute directory: {workspace!r}"
+        )
+    try:
+        workspace = str(workspace_path.resolve(strict=True))
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"cannot canonicalize kanban worker workspace {workspace!r}: {exc}") from exc
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -7967,6 +7985,10 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Only dispatcher-spawned workers receive this marker.  It activates the
+    # terminal/file containment boundary; ordinary interactive Hermes sessions
+    # keep their configured execution behavior unchanged.
+    env["HERMES_KANBAN_CONFINEMENT"] = "1"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -8056,7 +8078,19 @@ def _default_spawn(
         cmd.extend(["-m", task.model_override])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        # Keep only tools with the confinement-aware execution path.  Profile
+        # composites can include local Python, delegation, browser, or web
+        # clients; each would bypass either the workspace boundary or Docker's
+        # disabled network, so a deny-list would be unsafe as profiles evolve.
+        worker_toolsets = [
+            toolset for toolset in worker_toolsets
+            if toolset in _CONFINED_WORKER_ALLOWED_TOOLSETS
+        ]
+    if not worker_toolsets:
+        # A resolution failure must not omit --toolsets and accidentally fall
+        # back to the profile's unrestricted default composite.
+        worker_toolsets = list(_CONFINED_WORKER_FALLBACK_TOOLSETS)
+    cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
         "-q", prompt,
