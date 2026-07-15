@@ -3691,15 +3691,20 @@ def _declared_worktree_preflight_error(task: Task) -> Optional[str]:
     source = Path(task.worktree_source_root)
     if not source.is_absolute() or not source.is_dir() or not task.branch_name:
         return "declared worktree attestation is invalid"
+    try:
+        source = source.resolve(strict=True)
+        target = target.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return "declared worktree path cannot be resolved"
     def git(path: Path, *args: str) -> Optional[str]:
         try:
-            result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30, check=False)
-        except OSError:
+            result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30, check=False, env=_bootstrap_git_env())
+        except (OSError, subprocess.TimeoutExpired):
             return None
         return result.stdout.strip() if result.returncode == 0 else None
-    if git(source, "rev-parse", "--show-toplevel") != str(source.resolve()):
+    if git(source, "rev-parse", "--show-toplevel") != str(source):
         return "declared worktree source is not its Git top-level"
-    if git(target, "rev-parse", "--show-toplevel") != str(target.resolve()):
+    if git(target, "rev-parse", "--show-toplevel") != str(target):
         return "declared worktree is not its Git top-level"
     if git(source, "rev-parse", "--path-format=absolute", "--git-common-dir") != git(target, "rev-parse", "--path-format=absolute", "--git-common-dir"):
         return "declared worktree is not owned by declared source"
@@ -3707,6 +3712,8 @@ def _declared_worktree_preflight_error(task: Task) -> Optional[str]:
         return "declared worktree branch does not match"
     if git(target, "rev-parse", "HEAD^{commit}") != task.worktree_base_revision:
         return "declared worktree base revision does not match"
+    if git(source, "rev-parse", "HEAD^{commit}") != task.worktree_base_revision:
+        return "declared worktree source revision does not match"
     if git(target, "status", "--porcelain=v1", "--untracked-files=all"):
         return "declared worktree is dirty"
     return None
@@ -3735,18 +3742,23 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    candidate = get_task(conn, task_id)
+    snapshot = None
+    if candidate is not None and candidate.status == "ready":
+        preflight_error = _declared_worktree_preflight_error(candidate)
+        if preflight_error:
+            with write_txn(conn):
+                _append_event(conn, task_id, "claim_rejected", {"reason": preflight_error})
+            return None
+        snapshot = (candidate.workspace_path, candidate.branch_name, candidate.worktree_source_root, candidate.worktree_base_revision)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        candidate = get_task(conn, task_id)
-        if candidate is not None and candidate.status == "ready":
-            preflight_error = _declared_worktree_preflight_error(candidate)
-            if preflight_error:
-                _append_event(
-                    conn, task_id, "claim_rejected", {"reason": preflight_error}
-                )
-                return None
+        current = get_task(conn, task_id)
+        if snapshot is not None and current is not None and snapshot != (current.workspace_path, current.branch_name, current.worktree_source_root, current.worktree_base_revision):
+            _append_event(conn, task_id, "claim_rejected", {"reason": "declared worktree attestation changed during claim"})
+            return None
         mode_row = conn.execute(
             "SELECT execution_mode FROM tasks "
             "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
