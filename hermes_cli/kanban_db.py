@@ -2617,12 +2617,20 @@ def create_task(
         workspace = Path(str(workspace_path)).expanduser()
         if not workspace.is_absolute():
             raise ValueError("bootstrap workspace path must be absolute")
+        try:
+            workspace = workspace.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"bootstrap workspace path cannot be canonicalized: {exc}") from exc
         workspace_path = str(workspace)
         if not bootstrap_source_root or not bootstrap_base_revision:
             raise ValueError("bootstrap tasks require source root and base revision")
         source_root = Path(str(bootstrap_source_root)).expanduser()
         if not source_root.is_absolute():
             raise ValueError("bootstrap source root must be absolute")
+        try:
+            source_root = source_root.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"bootstrap source root cannot be canonicalized: {exc}") from exc
         if not re.fullmatch(r"[0-9a-fA-F]{40}", str(bootstrap_base_revision)):
             raise ValueError("bootstrap base revision must be a full 40-character SHA")
         bootstrap_source_root = str(source_root)
@@ -5949,7 +5957,7 @@ def _bootstrap_result(
 
 
 def _canonical_bootstrap_path(raw: Optional[str], label: str) -> tuple[Optional[Path], Optional[str]]:
-    if not raw or "\x00" in raw:
+    if not raw or any(character in raw for character in ("\x00", "\n", "\r")):
         return None, f"{label} is required"
     path = Path(raw).expanduser()
     if not path.is_absolute():
@@ -6064,17 +6072,35 @@ def _bootstrap_event_error(events: list[Event], expected: dict[str, str]) -> Opt
 
 
 def _bootstrap_git_env() -> dict[str, str]:
-    """Disable interactive prompting and repository hooks for fixed Git probes."""
-    env = os.environ.copy()
-    env.update(
-        {
-            "GIT_TERMINAL_PROMPT": "0",
-            "GCM_INTERACTIVE": "never",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": os.devnull,
-        }
+    """Build a fixed, non-interactive Git environment without caller authority."""
+    config = (
+        ("core.hooksPath", os.devnull),
+        ("core.fsmonitor", "false"),
+        ("core.attributesFile", os.devnull),
+        ("maintenance.auto", "false"),
+        ("submodule.recurse", "false"),
+        ("core.sparseCheckout", "false"),
+        ("core.sparseCheckoutCone", "false"),
     )
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/var/empty",
+        "XDG_CONFIG_HOME": "/var/empty",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/usr/bin/false",
+        "SSH_ASKPASS": "/usr/bin/false",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CONFIG_COUNT": str(len(config)),
+    }
+    for index, (key, value) in enumerate(config):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
     return env
 
 
@@ -6124,6 +6150,27 @@ def _bootstrap_git_stdout(
     return value, None
 
 
+def _bootstrap_filter_config_error(source: Path) -> Optional[str]:
+    """Reject checkout-capable filter commands from effective local config."""
+    result, error = _run_bootstrap_git(
+        source,
+        [
+            "config",
+            "--includes",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process)$",
+        ],
+    )
+    if error:
+        return error
+    assert result is not None
+    if result.returncode == 1:
+        return None
+    if result.returncode == 0:
+        return "repository declares executable Git filter configuration"
+    return "could not prove executable Git filter configuration is absent"
+
+
 def _bootstrap_git_path(value: str, label: str) -> tuple[Optional[Path], Optional[str]]:
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -6132,6 +6179,138 @@ def _bootstrap_git_path(value: str, label: str) -> tuple[Optional[Path], Optiona
         return path.resolve(strict=False), None
     except (OSError, RuntimeError) as exc:
         return None, f"{label} could not be resolved: {exc}"
+
+
+def _bootstrap_worktree_records(
+    source: Path,
+) -> tuple[Optional[list[dict[str, Optional[str]]]], Optional[str]]:
+    result, error = _run_bootstrap_git(
+        source,
+        ["worktree", "list", "--porcelain", "-z"],
+    )
+    if error:
+        return None, error
+    assert result is not None
+    if result.returncode != 0:
+        return None, "source worktree registration query failed"
+
+    records: list[dict[str, Optional[str]]] = []
+    record: dict[str, Optional[str]] = {}
+    for item in (result.stdout or "").split("\x00"):
+        if not item:
+            if record:
+                records.append(record)
+                record = {}
+            continue
+        key, separator, value = item.partition(" ")
+        if not key or key in record:
+            return None, "source worktree registration was ambiguous"
+        record[key] = value if separator else None
+    if record:
+        records.append(record)
+    if not records:
+        return None, "source worktree registration was empty"
+    return records, None
+
+
+def _bootstrap_registered_target_error(
+    task: Task,
+    source: Path,
+    target: Path,
+) -> Optional[str]:
+    records, error = _bootstrap_worktree_records(source)
+    if error:
+        return error
+    assert records is not None
+
+    matching: list[dict[str, Optional[str]]] = []
+    for record in records:
+        raw_path = record.get("worktree")
+        if not raw_path:
+            return "source worktree registration omitted a path"
+        registered_path, path_error = _bootstrap_git_path(
+            raw_path,
+            "registered worktree path",
+        )
+        if path_error:
+            return path_error
+        if registered_path == target:
+            matching.append(record)
+    if len(matching) != 1:
+        return "bootstrap target is not exactly once in registered worktrees"
+
+    record = matching[0]
+    if any(flag in record for flag in ("bare", "detached", "prunable")):
+        return "registered bootstrap target is bare, detached, or prunable"
+    if record.get("HEAD") != task.bootstrap_base_revision:
+        return "registered bootstrap target HEAD does not match declared base"
+    if record.get("branch") != f"refs/heads/{task.branch_name}":
+        return "registered bootstrap target branch does not match declaration"
+    return None
+
+
+def _bootstrap_pointer_path(
+    pointer_file: Path,
+    *,
+    label: str,
+    prefix: str = "",
+) -> tuple[Optional[Path], Optional[str]]:
+    try:
+        if pointer_file.is_symlink() or not pointer_file.is_file():
+            return None, f"{label} is not a non-symlink regular file"
+        raw = pointer_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return None, f"{label} could not be read: {exc}"
+    lines = raw.splitlines()
+    if len(lines) != 1 or "\x00" in lines[0] or "\r" in lines[0]:
+        return None, f"{label} is malformed"
+    value = lines[0]
+    if prefix:
+        if not value.startswith(prefix):
+            return None, f"{label} is malformed"
+        value = value[len(prefix):]
+    path = Path(value)
+    if not path.is_absolute():
+        return None, f"{label} did not contain an absolute path"
+    try:
+        return path.resolve(strict=False), None
+    except (OSError, RuntimeError) as exc:
+        return None, f"{label} path could not be resolved: {exc}"
+
+
+def _bootstrap_backpointer_error(
+    target: Path,
+    git_dir: Path,
+    common_dir: Path,
+) -> Optional[str]:
+    target_git_file = target / ".git"
+    declared_git_dir, error = _bootstrap_pointer_path(
+        target_git_file,
+        label="bootstrap target .git pointer",
+        prefix="gitdir: ",
+    )
+    if error:
+        return error
+    if declared_git_dir != git_dir:
+        return "bootstrap target .git pointer does not match its Git directory"
+
+    admin_root = (common_dir / "worktrees").resolve(strict=False)
+    try:
+        relative_admin = git_dir.relative_to(admin_root)
+    except ValueError:
+        return "bootstrap target Git directory is outside registered worktree admin"
+    if len(relative_admin.parts) != 1 or not git_dir.is_dir():
+        return "bootstrap target Git directory is not one exact worktree admin directory"
+
+    backpointer, error = _bootstrap_pointer_path(
+        git_dir / "gitdir",
+        label="bootstrap worktree admin backpointer",
+    )
+    if error:
+        return error
+    if backpointer != target_git_file.resolve(strict=False):
+        return "bootstrap worktree admin backpointer does not match the target"
+    return None
 
 
 def _validate_bootstrap_source(
@@ -6220,6 +6399,14 @@ def _validate_bootstrap_target(
     if common_dir != source_common_dir:
         return "bootstrap workspace belongs to a different Git common directory"
 
+    registration_error = _bootstrap_registered_target_error(
+        task,
+        Path(task.bootstrap_source_root or ""),
+        target,
+    )
+    if registration_error:
+        return registration_error
+
     git_dir_raw, error = _bootstrap_git_stdout(
         target,
         ["rev-parse", "--path-format=absolute", "--git-dir"],
@@ -6232,6 +6419,9 @@ def _validate_bootstrap_target(
         return error
     if git_dir == common_dir:
         return "bootstrap workspace is not a linked Git worktree"
+    backpointer_error = _bootstrap_backpointer_error(target, git_dir, common_dir)
+    if backpointer_error:
+        return backpointer_error
 
     branch, error = _bootstrap_git_stdout(
         target,
@@ -6343,6 +6533,30 @@ def prepare_bootstrap_workspace(
                         reason=current_event_error
                         or "bootstrap audit event disappeared during validation",
                     )
+                final_common_dir, final_error = _validate_bootstrap_source(
+                    current,
+                    Path(current.bootstrap_source_root or ""),
+                )
+                if final_error:
+                    return _bootstrap_result(
+                        task_id,
+                        current,
+                        ok=False,
+                        reason=final_error,
+                    )
+                assert final_common_dir is not None
+                final_error = _validate_bootstrap_target(
+                    current,
+                    Path(current.workspace_path or ""),
+                    final_common_dir,
+                )
+                if final_error:
+                    return _bootstrap_result(
+                        task_id,
+                        current,
+                        ok=False,
+                        reason=final_error,
+                    )
         except sqlite3.Error as exc:
             return _bootstrap_result(
                 task_id,
@@ -6374,6 +6588,15 @@ def prepare_bootstrap_workspace(
             task,
             ok=False,
             reason=f"could not prove declared bootstrap branch is absent{suffix}",
+        )
+
+    filter_error = _bootstrap_filter_config_error(source)
+    if filter_error:
+        return _bootstrap_result(
+            task_id,
+            task,
+            ok=False,
+            reason=filter_error,
         )
 
     add_result, git_error = _run_bootstrap_git(
@@ -6431,6 +6654,34 @@ def prepare_bootstrap_workspace(
                     ok=False,
                     reason="bootstrap audit state changed after workspace materialization",
                 )
+            final_common_dir, final_error = _validate_bootstrap_source(
+                current,
+                Path(current.bootstrap_source_root or ""),
+            )
+            if final_error:
+                return _bootstrap_result(
+                    task_id,
+                    current,
+                    ok=False,
+                    reason=final_error,
+                )
+            assert final_common_dir is not None
+            final_error = _validate_bootstrap_target(
+                current,
+                Path(current.workspace_path or ""),
+                final_common_dir,
+            )
+            if final_error:
+                return _bootstrap_result(
+                    task_id,
+                    current,
+                    ok=False,
+                    reason=final_error,
+                )
+            # SQLite cannot make Git filesystem state and this row one atomic
+            # resource. Revalidating under BEGIN IMMEDIATE establishes the
+            # narrowest durable point-in-time boundary; an unrelated same-user
+            # process that ignores Hermes locks remains outside this contract.
             _append_event(
                 conn,
                 task_id,
@@ -6740,20 +6991,42 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    value = str(path)
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT bootstrap_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row
+            and row["bootstrap_kind"] is not None
+            and row["workspace_path"] != value
+        ):
+            raise ValueError("bootstrap workspace identity is immutable")
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (str(path), task_id),
+            (value, task_id),
         )
 
 
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
+    value = str(branch_name)
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT bootstrap_kind, branch_name FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row
+            and row["bootstrap_kind"] is not None
+            and row["branch_name"] != value
+        ):
+            raise ValueError("bootstrap branch identity is immutable")
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
-            (str(branch_name), task_id),
+            (value, task_id),
         )
 
 

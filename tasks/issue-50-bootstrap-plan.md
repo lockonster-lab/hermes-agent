@@ -13,7 +13,7 @@ prior runs. It never claims, promotes, dispatches, or executes a worker.
 - The caller is the local coordinator already authorized by a recorded
   TaskContract gate; the code makes that authorization narrow and auditable,
   rather than treating a CLI invocation as a generic host fallback.
-- Source and worktree paths are local, absolute paths. No network, Docker,
+- Source and worktree paths are local, canonical absolute paths. No network, Docker,
   package, provider, credential, raw-data, client-repository, cleanup, push,
   PR, merge, or rebase operation is in scope.
 - Existing `tasks/plan.md` and `tasks/todo.md` document #43 and are preserved.
@@ -35,14 +35,18 @@ fails closed unless all of the following hold:
 2. its kind is `self_repair` and every bootstrap field is present;
 3. the declared source root is a Git top-level whose current `HEAD` equals
    the declared base revision;
-4. the declared workspace is either absent or already the matching linked
-   worktree on the declared branch; and
-5. Git can create precisely that worktree from the declared base.
+4. the declared workspace is either absent or exactly once registered as the
+   matching linked worktree, with matching Git/admin backpointers, branch and
+   `HEAD`; and
+5. sanitized Git config contains no executable checkout filter and Git can
+   create precisely that worktree from the declared base without replace
+   objects, lazy fetch, hooks, fsmonitor or submodule recursion.
 
-The first successful preparation appends one `bootstrap_workspace_prepared`
-event including the task-bound identity and approval. A matching repeat is
-idempotent and does not widen authority. Every denial occurs before any Git
-worktree subprocess.
+The first successful preparation revalidates TaskContract, source and target
+identity at the durable boundary, then appends one
+`bootstrap_workspace_prepared` event including the task-bound identity and
+approval. A matching repeat is idempotent and does not widen authority. Every
+denial occurs before any Git worktree mutation.
 
 ## Project structure and commands
 
@@ -75,13 +79,20 @@ external call is permitted.
 
 ## Threat model and success criteria
 
-The trust boundary is local coordinator input and persisted TaskContract
-metadata. Abuse cases are: preparing another task's workspace, substituting a
-branch/base/path after approval, using a ready/worker/running task, replaying
-after a run, and using a pre-existing foreign checkout. Mitigations are
-creation-time validation, runtime exact equality checks, branch/common-Git-dir
-verification, parameterized SQL, a durable audit event, idempotence, and
-Popen/subprocess sentinels in denial tests.
+The trust boundary is local coordinator input, the declared source repository,
+and persisted TaskContract metadata. Abuse cases are: preparing another task's
+workspace, substituting a branch/base/path after approval, inherited Git
+environment redirection, checkout filters, replace refs or lazy fetch, using a
+ready/worker/running task, replaying after a run, and adopting a foreign or
+transplanted checkout. Mitigations are creation-time canonicalization,
+immutable public setters, allowlisted Git environment, runtime exact equality
+and registration/backpointer checks, final revalidation, parameterized SQL, a
+durable audit event, idempotence, and subprocess sentinels in denial tests.
+
+SQLite and the Git filesystem cannot form one atomic transaction. Final Git
+revalidation under the immediate database transaction establishes the durable
+point-in-time boundary; an unrelated same-user process that deliberately
+ignores Hermes coordination remains a documented local residual.
 
 Success means all acceptance checks above are covered by offline tests, the
 default worker lifecycle is unchanged, and no permitted input can become a

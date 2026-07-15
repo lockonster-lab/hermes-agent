@@ -21,7 +21,7 @@
 - [x] Implement task-bound `bootstrap-prepare` and a durable audit event.
   - Acceptance: it validates blocked/manual/coordinator/no-run state, exact
     source `HEAD`, base, worktree and branch; it is idempotent; every denial
-    precedes Git subprocess execution.
+    precedes Git worktree mutation.
   - Verify: Popen/subprocess sentinel tests plus focused test command.
   - Files: `hermes_cli/kanban_db.py`, `hermes_cli/kanban.py`,
     `tests/hermes_cli/test_kanban_bootstrap.py`,
