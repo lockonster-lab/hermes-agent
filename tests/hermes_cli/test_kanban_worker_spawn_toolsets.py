@@ -143,7 +143,8 @@ def test_confined_worker_docker_image_uses_the_safe_default_for_blank_setting(mo
 
     monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "  ")
     assert kb._confined_worker_docker_image() == (
-        "nikolaik/python-nodejs:python3.11-nodejs20"
+        "nikolaik/python-nodejs:python3.11-nodejs22-slim@"
+        "sha256:ca6209d2d2202b52e8b1e88b7120af1de4195d37a454045034bc375adeda6ca2"
     )
 
 
@@ -153,8 +154,87 @@ def test_confined_worker_docker_image_ignores_an_inherited_image_override(monkey
 
     monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "untrusted:latest")
     assert kb._confined_worker_docker_image() == (
-        "nikolaik/python-nodejs:python3.11-nodejs20"
+        "nikolaik/python-nodejs:python3.11-nodejs22-slim@"
+        "sha256:ca6209d2d2202b52e8b1e88b7120af1de4195d37a454045034bc375adeda6ca2"
     )
+
+
+def test_confined_worker_docker_image_uses_the_approved_immutable_reference():
+    """Dispatcher policy must select the reviewed tag-and-digest image."""
+    from hermes_cli import kanban_db as kb
+
+    assert kb._confined_worker_docker_image() == (
+        "nikolaik/python-nodejs:python3.11-nodejs22-slim@"
+        "sha256:ca6209d2d2202b52e8b1e88b7120af1de4195d37a454045034bc375adeda6ca2"
+    )
+
+
+@pytest.mark.parametrize(
+    ("image", "message"),
+    [
+        ("", "image is empty"),
+        ("nikolaik/python-nodejs:python3.11-nodejs22-slim", "approved immutable reference"),
+        (
+            "nikolaik/python-nodejs@"
+            "sha256:ca6209d2d2202b52e8b1e88b7120af1de4195d37a454045034bc375adeda6ca2",
+            "approved immutable reference",
+        ),
+        (
+            "nikolaik/python-nodejs:python3.11-nodejs22-slim@"
+            "sha256:ca6209d2d2202b52e8b1e88b7120af1de4195d37a454045034bc375adeda6cb2",
+            "approved immutable reference",
+        ),
+    ],
+)
+def test_confined_preflight_rejects_a_noncanonical_reference_before_docker_inspect(
+    monkeypatch, image, message,
+):
+    """Missing, tag-only, bare-digest, and mismatched refs cannot reach Docker."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb.shutil, "which", lambda command: "/usr/bin/docker")
+    monkeypatch.setattr(
+        kb.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("unapproved references must not be inspected"),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        kb._preflight_confined_worker_docker_image(image)
+
+
+def test_default_spawn_rejects_an_unpinned_reference_before_popen(monkeypatch, tmp_path):
+    """A future policy regression cannot start a worker on a mutable image."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        kb,
+        "_confined_worker_docker_image",
+        lambda: "nikolaik/python-nodejs:python3.11-nodejs22-slim",
+    )
+    monkeypatch.setattr(kb.shutil, "which", lambda command: "/usr/bin/docker")
+    monkeypatch.setattr(
+        kb.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        kb.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("worker must not spawn with a mutable image"),
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="approved immutable reference"):
+        kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
 
 def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):

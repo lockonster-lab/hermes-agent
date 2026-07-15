@@ -8062,7 +8062,10 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 
 _CONFINED_WORKER_ALLOWED_TOOLSETS = frozenset({"file", "skills", "terminal"})
 _CONFINED_WORKER_FALLBACK_TOOLSETS = ("file", "skills", "terminal")
-_CONFINED_WORKER_DEFAULT_DOCKER_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
+_CONFINED_WORKER_DEFAULT_DOCKER_IMAGE = (
+    "nikolaik/python-nodejs:python3.11-nodejs22-slim@"
+    "sha256:ca6209d2d2202b52e8b1e88b7120af1de4195d37a454045034bc375adeda6ca2"
+)
 
 
 def _confined_worker_docker_image() -> str:
@@ -8085,6 +8088,10 @@ def _preflight_confined_worker_docker_image(image: str) -> None:
     """
     if not image:
         raise RuntimeError("confined Docker image is unavailable: image is empty")
+    if image != _CONFINED_WORKER_DEFAULT_DOCKER_IMAGE:
+        raise RuntimeError(
+            "confined Docker image must match the approved immutable reference"
+        )
     docker = shutil.which("docker")
     if not docker:
         raise RuntimeError("confined Docker image is unavailable: Docker CLI is not installed")
