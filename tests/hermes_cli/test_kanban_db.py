@@ -3116,6 +3116,9 @@ class TestSharedBoardPaths:
                 self.pid = 4242
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        monkeypatch.setattr(
+            kb, "_preflight_confined_worker_docker_image", lambda _image: None,
+        )
 
         task = kb.Task(
             id="t_dispatch_env",

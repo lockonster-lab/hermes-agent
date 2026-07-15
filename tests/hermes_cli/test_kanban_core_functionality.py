@@ -2788,6 +2788,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_preflight_confined_worker_docker_image", lambda _image: None,
+    )
 
     conn = kb.connect()
     try:
@@ -2832,6 +2835,9 @@ def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monk
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_preflight_confined_worker_docker_image", lambda _image: None,
+    )
     monkeypatch.setenv("TERMINAL_TIMEOUT", "180")
     monkeypatch.delenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", raising=False)
 
@@ -2866,6 +2872,9 @@ def test_default_spawn_preserves_longer_terminal_timeout(kanban_home, monkeypatc
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_preflight_confined_worker_docker_image", lambda _image: None,
+    )
     monkeypatch.setenv("TERMINAL_TIMEOUT", "7200")
     monkeypatch.setenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", "7200")
 
@@ -2899,6 +2908,9 @@ def test_default_spawn_leaves_terminal_timeout_without_runtime_cap(kanban_home, 
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_preflight_confined_worker_docker_image", lambda _image: None,
+    )
     monkeypatch.setenv("TERMINAL_TIMEOUT", "180")
     monkeypatch.delenv("TERMINAL_MAX_FOREGROUND_TIMEOUT", raising=False)
 
@@ -3054,6 +3066,9 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_preflight_confined_worker_docker_image", lambda _image: None,
+    )
 
     conn = kb.connect()
     try:
@@ -3101,6 +3116,9 @@ def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_preflight_confined_worker_docker_image", lambda _image: None,
+    )
 
     conn = kb.connect()
     try:
@@ -3220,7 +3238,7 @@ def test_legacy_spawn_failure_columns_are_copied_not_renamed(tmp_path):
     """Legacy failure counters survive migration without fragile column renames."""
     import sqlite3
     db_path = tmp_path / "legacy-failures.db"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE tasks (
