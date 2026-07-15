@@ -7918,6 +7918,44 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 
 _CONFINED_WORKER_ALLOWED_TOOLSETS = frozenset({"file", "skills", "terminal"})
 _CONFINED_WORKER_FALLBACK_TOOLSETS = ("file", "skills", "terminal")
+_CONFINED_WORKER_DEFAULT_DOCKER_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
+
+
+def _confined_worker_docker_image() -> str:
+    """Return the image that a dispatcher has selected for one worker.
+
+    The child profile and parent shell may normally configure terminal images.
+    A confined worker is different: its image is dispatcher policy, so the
+    preflight is not tricked into checking one image while the worker runs
+    another.
+    """
+    return _CONFINED_WORKER_DEFAULT_DOCKER_IMAGE
+
+
+def _preflight_confined_worker_docker_image(image: str) -> None:
+    """Fail before spawn unless *image* is already available locally.
+
+    ``docker image inspect`` is read-only and never pulls an image.  This
+    prevents a high-risk worker from reaching the model only to discover that
+    its Docker-only execution boundary cannot be created.
+    """
+    if not image:
+        raise RuntimeError("confined Docker image is unavailable: image is empty")
+    docker = shutil.which("docker")
+    if not docker:
+        raise RuntimeError("confined Docker image is unavailable: Docker CLI is not installed")
+    try:
+        result = subprocess.run(
+            [docker, "image", "inspect", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("confined Docker image is unavailable: Docker daemon is not ready") from exc
+    if result.returncode != 0:
+        raise RuntimeError("confined Docker image is unavailable locally; pre-provision an approved image before dispatch")
 
 
 def _default_spawn(
@@ -7993,6 +8031,13 @@ def _default_spawn(
     # selected backend.  Pin the worker to Docker so a normal interactive
     # default of TERMINAL_ENV=local cannot turn a queued task into a host run.
     env["TERMINAL_ENV"] = "docker"
+    # Pin the exact image in a dispatcher-owned variable and check it before
+    # the worker starts.  Profile dotenv remains free to configure ordinary
+    # sessions, but it cannot silently replace the image that passed this
+    # capability gate (the terminal backend consumes this marker below).
+    docker_image = _confined_worker_docker_image()
+    env["HERMES_KANBAN_DOCKER_IMAGE"] = docker_image
+    env["TERMINAL_DOCKER_IMAGE"] = docker_image
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -8050,6 +8095,8 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    _preflight_confined_worker_docker_image(docker_image)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

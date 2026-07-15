@@ -74,6 +74,18 @@ def test_confined_worker_denies_local_terminal_before_environment_creation(monke
     assert calls == []
 
 
+def test_confined_worker_uses_the_dispatcher_pinned_docker_image(monkeypatch, tmp_path):
+    """Profile configuration cannot switch a checked worker image after spawn."""
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    _mark_kanban_worker(monkeypatch, workspace)
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "profile-image:unsafe")
+    monkeypatch.setenv("HERMES_KANBAN_DOCKER_IMAGE", "checked-image:stable")
+
+    assert terminal_tool._get_env_config()["docker_image"] == "checked-image:stable"
+
+
 @pytest.mark.parametrize("command", ["python -m venv .venv", "pip install pytest"])
 def test_confined_worker_blocks_toolchain_recovery_inside_container(monkeypatch, tmp_path, command):
     workspace = tmp_path / "worktree"

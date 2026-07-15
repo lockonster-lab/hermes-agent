@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -22,6 +24,11 @@ def _make_task(kb, *, assignee: str):
         tenant=None,
         current_run_id=7,
     )
+
+
+def _allow_confined_docker_preflight(monkeypatch, kb):
+    """Keep argv/toolset unit tests independent of the host Docker cache."""
+    monkeypatch.setattr(kb, "_preflight_confined_worker_docker_image", lambda image: None)
 
 
 def test_default_spawn_removes_unconfined_execution_toolsets(monkeypatch, tmp_path):
@@ -61,6 +68,7 @@ agent:
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    _allow_confined_docker_preflight(monkeypatch, kb)
 
     captured = {}
 
@@ -91,6 +99,64 @@ agent:
     assert "delegation" not in pinned
 
 
+def test_default_spawn_blocks_before_popen_when_confined_docker_image_is_unavailable(
+    monkeypatch, tmp_path,
+):
+    """A worker must not start when its only allowed backend is not local.
+
+    Dispatch used to launch the model and defer this capability failure until
+    its first terminal/file call.  That leaves a high-risk task claimed while
+    no safe execution path exists.  The dispatcher must instead reject the
+    spawn before Popen when the fixed confinement image is absent locally.
+    """
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "safe-worker:test")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb.shutil, "which", lambda command: "/usr/bin/docker")
+    monkeypatch.setattr(
+        kb.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", "missing"),
+    )
+    monkeypatch.setattr(
+        kb.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("worker must not spawn without its Docker image"),
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="confined Docker image is unavailable"):
+        kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+
+
+def test_confined_worker_docker_image_uses_the_safe_default_for_blank_setting(monkeypatch):
+    """An empty inherited setting must not turn into an unchecked image."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "  ")
+    assert kb._confined_worker_docker_image() == (
+        "nikolaik/python-nodejs:python3.11-nodejs20"
+    )
+
+
+def test_confined_worker_docker_image_ignores_an_inherited_image_override(monkeypatch):
+    """Only the dispatcher policy, never inherited shell state, selects it."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("TERMINAL_DOCKER_IMAGE", "untrusted:latest")
+    assert kb._confined_worker_docker_image() == (
+        "nikolaik/python-nodejs:python3.11-nodejs20"
+    )
+
+
 def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     """Workers are headless: an inherited HERMES_TUI=1 (or a TUI-default
     config) must not send the quiet chat run into the Ink TUI, whose no-TTY
@@ -106,6 +172,7 @@ def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    _allow_confined_docker_preflight(monkeypatch, kb)
 
     captured = {}
 
@@ -138,6 +205,7 @@ def test_default_spawn_uses_safe_toolset_pin_when_profile_resolution_fails(monke
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda home: None)
+    _allow_confined_docker_preflight(monkeypatch, kb)
     captured = {}
 
     class FakeProc:
@@ -176,6 +244,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     from hermes_cli._parser import build_top_level_parser
 
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    _allow_confined_docker_preflight(monkeypatch, kb)
     captured = {}
 
     class FakeProc:

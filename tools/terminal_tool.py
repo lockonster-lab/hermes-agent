@@ -1258,6 +1258,14 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     env_type = os.getenv("TERMINAL_ENV", "local")
+    docker_image = os.getenv("TERMINAL_DOCKER_IMAGE", default_image)
+    # A dispatcher validates this exact image before it spawns a confined
+    # worker.  Do not let profile dotenv select a different image afterwards:
+    # that would make the preflight evidence describe the wrong execution
+    # boundary.  Ordinary interactive Docker sessions keep their existing
+    # TERMINAL_DOCKER_IMAGE behavior.
+    if os.getenv("HERMES_KANBAN_CONFINEMENT") == "1":
+        docker_image = os.getenv("HERMES_KANBAN_DOCKER_IMAGE", docker_image)
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
     container_backend = env_type in {"docker", "singularity", "modal", "daytona"}
@@ -1325,7 +1333,7 @@ def _get_env_config() -> Dict[str, Any]:
     return {
         "env_type": env_type,
         "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
-        "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
+        "docker_image": docker_image,
         "docker_forward_env": docker_forward_env,
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
