@@ -396,6 +396,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    # --- bootstrap-prepare ---
+    p_bootstrap_prepare = sub.add_parser(
+        "bootstrap-prepare",
+        help="Prepare the exact worktree declared by a self-repair TaskContract",
+    )
+    p_bootstrap_prepare.add_argument("task_id")
+    p_bootstrap_prepare.add_argument(
+        "approval",
+        nargs="+",
+        help="Recorded manual approval bound to this one exact preparation",
+    )
+    p_bootstrap_prepare.add_argument("--json", action="store_true")
+
     # --- coordinator-only ---
     p_coordinator_only = sub.add_parser(
         "coordinator-only",
@@ -998,6 +1011,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "bootstrap-prepare": _cmd_bootstrap_prepare,
             "coordinator-only": _cmd_coordinator_only,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -2141,6 +2155,39 @@ def _cmd_coordinator_only(args: argparse.Namespace) -> int:
     else:
         print(f"cannot enroll {args.task_id}: {error}", file=sys.stderr)
     return 0 if enrolled else 1
+
+
+def _cmd_bootstrap_prepare(args: argparse.Namespace) -> int:
+    """Run the narrow self-repair preparation policy and expose its audit identity."""
+    approval = " ".join(args.approval).strip()
+    with kb.connect_closing() as conn:
+        result = kb.prepare_bootstrap_workspace(
+            conn,
+            args.task_id,
+            actor=_profile_author(),
+            approval=approval,
+        )
+
+    payload = {
+        "task_id": result.task_id,
+        "ok": result.ok,
+        "idempotent": result.idempotent,
+        "reason": result.reason,
+        "workspace_path": result.workspace_path,
+        "branch_name": result.branch_name,
+        "base_revision": result.base_revision,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    elif result.ok:
+        prefix = "Already prepared" if result.idempotent else "Prepared"
+        print(f"{prefix} {args.task_id} at {result.workspace_path}")
+    else:
+        print(
+            f"cannot prepare bootstrap workspace for {args.task_id}: {result.reason}",
+            file=sys.stderr,
+        )
+    return 0 if result.ok else 1
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

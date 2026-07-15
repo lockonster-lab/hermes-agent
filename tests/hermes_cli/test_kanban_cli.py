@@ -216,6 +216,43 @@ def test_run_slash_create_declares_self_repair_bootstrap(kanban_home):
     assert payload["bootstrap_base_revision"] == "a" * 40
 
 
+def test_run_slash_bootstrap_prepare_emits_json(kanban_home, monkeypatch):
+    calls = {}
+
+    def fake_prepare(conn, task_id, *, actor, approval):
+        calls.update(task_id=task_id, actor=actor, approval=approval)
+        return argparse.Namespace(
+            task_id=task_id,
+            ok=True,
+            idempotent=False,
+            reason=None,
+            workspace_path="/private/tmp/bootstrap-target",
+            branch_name="codex/bootstrap-target",
+            base_revision="a" * 40,
+        )
+
+    monkeypatch.setattr(kb, "prepare_bootstrap_workspace", fake_prepare, raising=False)
+    out = kc.run_slash(
+        "bootstrap-prepare t_bootstrap 'recorded single-use gate' --json"
+    )
+    payload = json.loads(out)
+
+    assert calls == {
+        "task_id": "t_bootstrap",
+        "actor": "default",
+        "approval": "recorded single-use gate",
+    }
+    assert payload == {
+        "task_id": "t_bootstrap",
+        "ok": True,
+        "idempotent": False,
+        "reason": None,
+        "workspace_path": "/private/tmp/bootstrap-target",
+        "branch_name": "codex/bootstrap-target",
+        "base_revision": "a" * 40,
+    }
+
+
 def test_run_slash_promote_json_keeps_execution_mode_visible(kanban_home):
     with kb.connect_closing() as conn:
         task_id = kb.create_task(

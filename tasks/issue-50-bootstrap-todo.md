@@ -18,7 +18,7 @@
 
 ## Slice 3 — exact offline preparation
 
-- [ ] Implement task-bound `bootstrap-prepare` and a durable audit event.
+- [x] Implement task-bound `bootstrap-prepare` and a durable audit event.
   - Acceptance: it validates blocked/manual/coordinator/no-run state, exact
     source `HEAD`, base, worktree and branch; it is idempotent; every denial
     precedes Git subprocess execution.
