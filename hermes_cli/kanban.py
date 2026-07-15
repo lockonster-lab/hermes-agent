@@ -82,6 +82,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "current_step_key": t.current_step_key,
         "requires_manual_promotion": t.requires_manual_promotion,
         "execution_mode": t.execution_mode,
+        "bootstrap_kind": t.bootstrap_kind,
+        "bootstrap_source_root": t.bootstrap_source_root,
+        "bootstrap_base_revision": t.bootstrap_base_revision,
     }
 
 
@@ -374,6 +377,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=kb.EXECUTION_MODE_WORKER,
         help="TaskContract execution mode. coordinator_only requires "
              "--initial-status blocked and is never worker-dispatched.",
+    )
+    p_create.add_argument(
+        "--bootstrap-kind",
+        choices=sorted(kb.VALID_BOOTSTRAP_KINDS),
+        default=None,
+        help="Immutable narrow bootstrap contract kind (self_repair only).",
+    )
+    p_create.add_argument(
+        "--bootstrap-source-root",
+        default=None,
+        help="Absolute Git source root declared by a self-repair contract.",
+    )
+    p_create.add_argument(
+        "--bootstrap-base-revision",
+        default=None,
+        help="Full 40-character Git revision declared by a self-repair contract.",
     )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
@@ -1371,6 +1390,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
             execution_mode=getattr(args, "execution_mode", kb.EXECUTION_MODE_WORKER),
+            bootstrap_kind=getattr(args, "bootstrap_kind", None),
+            bootstrap_source_root=getattr(args, "bootstrap_source_root", None),
+            bootstrap_base_revision=getattr(args, "bootstrap_base_revision", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

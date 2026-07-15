@@ -107,6 +107,8 @@ VALID_EXECUTION_MODES = {
     EXECUTION_MODE_WORKER,
     EXECUTION_MODE_COORDINATOR_ONLY,
 }
+BOOTSTRAP_KIND_SELF_REPAIR = "self_repair"
+VALID_BOOTSTRAP_KINDS = {BOOTSTRAP_KIND_SELF_REPAIR}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -928,6 +930,11 @@ class Task:
     # They may be promoted for visibility, but no generic worker may claim or
     # spawn them. ``worker`` preserves the legacy/default lifecycle.
     execution_mode: str = EXECUTION_MODE_WORKER
+    # Immutable declaration for the narrow, offline self-repair bootstrap
+    # executor. All three identity fields are required with the kind.
+    bootstrap_kind: Optional[str] = None
+    bootstrap_source_root: Optional[str] = None
+    bootstrap_base_revision: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1020,6 +1027,21 @@ class Task:
                 row["execution_mode"]
                 if "execution_mode" in keys and row["execution_mode"]
                 else EXECUTION_MODE_WORKER
+            ),
+            bootstrap_kind=(
+                row["bootstrap_kind"]
+                if "bootstrap_kind" in keys and row["bootstrap_kind"]
+                else None
+            ),
+            bootstrap_source_root=(
+                row["bootstrap_source_root"]
+                if "bootstrap_source_root" in keys and row["bootstrap_source_root"]
+                else None
+            ),
+            bootstrap_base_revision=(
+                row["bootstrap_base_revision"]
+                if "bootstrap_base_revision" in keys and row["bootstrap_base_revision"]
+                else None
             ),
         )
 
@@ -1203,7 +1225,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     requires_manual_promotion INTEGER NOT NULL DEFAULT 0,
     -- Durable TaskContract execution boundary. Coordinator-only tasks never
     -- enter a worker claim/workspace/Popen lifecycle.
-    execution_mode       TEXT NOT NULL DEFAULT 'worker'
+    execution_mode       TEXT NOT NULL DEFAULT 'worker',
+    -- Immutable identity for the deliberately narrow self-repair bootstrap.
+    bootstrap_kind          TEXT,
+    bootstrap_source_root   TEXT,
+    bootstrap_base_revision TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2057,6 +2083,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "execution_mode TEXT NOT NULL DEFAULT 'worker'",
         )
 
+    if "bootstrap_kind" not in cols:
+        _add_column_if_missing(conn, "tasks", "bootstrap_kind", "bootstrap_kind TEXT")
+    if "bootstrap_source_root" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "bootstrap_source_root",
+            "bootstrap_source_root TEXT",
+        )
+    if "bootstrap_base_revision" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "bootstrap_base_revision",
+            "bootstrap_base_revision TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2476,6 +2519,9 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     execution_mode: str = EXECUTION_MODE_WORKER,
+    bootstrap_kind: Optional[str] = None,
+    bootstrap_source_root: Optional[str] = None,
+    bootstrap_base_revision: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -2531,6 +2577,41 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    bootstrap_fields = (
+        bootstrap_source_root,
+        bootstrap_base_revision,
+    )
+    if bootstrap_kind is not None:
+        bootstrap_kind = str(bootstrap_kind).strip() or None
+    if bootstrap_kind is None:
+        if any(field is not None for field in bootstrap_fields):
+            raise ValueError("bootstrap identity requires bootstrap_kind")
+    else:
+        if bootstrap_kind not in VALID_BOOTSTRAP_KINDS:
+            raise ValueError(
+                f"bootstrap_kind must be one of {sorted(VALID_BOOTSTRAP_KINDS)}"
+            )
+        if execution_mode != EXECUTION_MODE_COORDINATOR_ONLY:
+            raise ValueError("bootstrap tasks require coordinator_only execution_mode")
+        if initial_status != "blocked":
+            raise ValueError("bootstrap tasks require initial_status='blocked'")
+        if workspace_kind != "worktree" or not workspace_path or not branch_name:
+            raise ValueError(
+                "bootstrap tasks require an explicit worktree path and branch_name"
+            )
+        workspace = Path(str(workspace_path)).expanduser()
+        if not workspace.is_absolute():
+            raise ValueError("bootstrap workspace path must be absolute")
+        if not bootstrap_source_root or not bootstrap_base_revision:
+            raise ValueError("bootstrap tasks require source root and base revision")
+        source_root = Path(str(bootstrap_source_root)).expanduser()
+        if not source_root.is_absolute():
+            raise ValueError("bootstrap source root must be absolute")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", str(bootstrap_base_revision)):
+            raise ValueError("bootstrap base revision must be a full 40-character SHA")
+        bootstrap_source_root = str(source_root)
+        bootstrap_base_revision = str(bootstrap_base_revision).lower()
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2721,8 +2802,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        requires_manual_promotion, execution_mode
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        requires_manual_promotion, execution_mode, bootstrap_kind,
+                        bootstrap_source_root, bootstrap_base_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2747,6 +2829,9 @@ def create_task(
                         session_id,
                         manual_promotion_required,
                         execution_mode,
+                        bootstrap_kind,
+                        bootstrap_source_root,
+                        bootstrap_base_revision,
                     ),
                 )
                 for pid in parents:
@@ -2767,6 +2852,7 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "execution_mode": execution_mode,
+                        "bootstrap_kind": bootstrap_kind,
                     },
                 )
                 if initial_status == "blocked":

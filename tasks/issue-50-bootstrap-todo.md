@@ -9,7 +9,7 @@
 
 ## Slice 2 — immutable declaration
 
-- [ ] Add failing tests for declaration validation and immutable JSON fields.
+- [x] Add failing tests for declaration validation and immutable JSON fields.
   - Acceptance: ordinary worker/coordinator tasks cannot claim bootstrap
     authority, and incomplete/path-relative declarations are rejected.
   - Verify: focused test is RED before implementation, then GREEN.

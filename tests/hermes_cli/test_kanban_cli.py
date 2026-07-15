@@ -200,6 +200,22 @@ def test_run_slash_create_and_show_make_execution_mode_visible(kanban_home):
     assert shown["task"]["execution_mode"] == "coordinator_only"
 
 
+def test_run_slash_create_declares_self_repair_bootstrap(kanban_home):
+    out = kc.run_slash(
+        "create 'self repair' --assignee alice --workspace "
+        "worktree:/private/tmp/bootstrap-target --branch codex/bootstrap-target "
+        "--initial-status blocked --execution-mode coordinator_only "
+        "--bootstrap-kind self_repair "
+        "--bootstrap-source-root /private/tmp/bootstrap-source "
+        f"--bootstrap-base-revision {'a' * 40} --json"
+    )
+    payload = json.loads(out)
+
+    assert payload["bootstrap_kind"] == "self_repair"
+    assert payload["bootstrap_source_root"] == "/private/tmp/bootstrap-source"
+    assert payload["bootstrap_base_revision"] == "a" * 40
+
+
 def test_run_slash_promote_json_keeps_execution_mode_visible(kanban_home):
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
