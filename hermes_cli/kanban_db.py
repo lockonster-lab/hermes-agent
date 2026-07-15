@@ -3902,10 +3902,23 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    candidate = get_task(conn, task_id)
+    snapshot = None
+    if candidate is not None and candidate.status == "review":
+        error = _declared_worktree_preflight_error(candidate)
+        if error:
+            with write_txn(conn):
+                _append_event(conn, task_id, "claim_rejected", {"reason": error, "source_status": "review"})
+            return None
+        snapshot = (candidate.workspace_path, candidate.branch_name, candidate.worktree_source_root, candidate.worktree_base_revision)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        current = get_task(conn, task_id)
+        if snapshot is not None and current is not None and snapshot != (current.workspace_path, current.branch_name, current.worktree_source_root, current.worktree_base_revision):
+            _append_event(conn, task_id, "claim_rejected", {"reason": "declared worktree attestation changed during claim", "source_status": "review"})
+            return None
         mode_row = conn.execute(
             "SELECT execution_mode FROM tasks "
             "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
@@ -7098,15 +7111,15 @@ def set_workspace_path(
     value = str(path)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT bootstrap_kind, workspace_path FROM tasks WHERE id = ?",
+            "SELECT bootstrap_kind, worktree_source_root, workspace_path FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if (
             row
-            and row["bootstrap_kind"] is not None
+            and (row["bootstrap_kind"] is not None or row["worktree_source_root"] is not None)
             and row["workspace_path"] != value
         ):
-            raise ValueError("bootstrap workspace identity is immutable")
+            raise ValueError("declared worktree identity is immutable")
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (value, task_id),
@@ -7119,15 +7132,15 @@ def set_branch_name(
     value = str(branch_name)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT bootstrap_kind, branch_name FROM tasks WHERE id = ?",
+            "SELECT bootstrap_kind, worktree_source_root, branch_name FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if (
             row
-            and row["bootstrap_kind"] is not None
+            and (row["bootstrap_kind"] is not None or row["worktree_source_root"] is not None)
             and row["branch_name"] != value
         ):
-            raise ValueError("bootstrap branch identity is immutable")
+            raise ValueError("declared worktree identity is immutable")
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (value, task_id),
